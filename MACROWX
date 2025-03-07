@@ -1,0 +1,655 @@
+function macroName() {  
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();  
+  const rawSheet = sheet.getActiveSheet();  
+
+  const readySheet = sheet.getSheetByName("READY") || sheet.insertSheet("READY");  
+  const reviewSheet = sheet.getSheetByName("REVIEW") || sheet.insertSheet("REVIEW");  
+
+  readySheet.clear();  
+  reviewSheet.clear();  
+
+  const data = rawSheet.getDataRange().getValues();  
+  const headers = data.shift();  
+
+  // Initialize counter
+  let counter = 1;
+
+  const getTemplate1 = (count) => `**WAREHOUSE TRANSFER / TRANSSHIP**${String(count).padStart(2, '0')}  
+
+These units were transferred out but not received within the 60-day timeframe. Please proceed with the reimbursement process.  
+
+*Insert Data Here*  
+
+Note: If the inventory in question has been reconciled, please provide the fulfillment center where the units were transferred back for our inventory monitoring purposes. If you do not have the capability to provide the downstream FC, please escalate the case to the Captive Team.   
+Thank you.`;  
+
+  const getTemplate2 = (count) => `**WAREHOUSE TRANSFER / TRANSSHIP**${String(count).padStart(2, '0')}  
+
+Please see the data set below, there are more events for outgoing vs incoming for the same quantity, one or more of those outgoings were not received within the 60-day timeframe. Please proceed with the reimbursement process.  
+
+*Insert data here*  
+
+Note: If the inventory in question has been reconciled, please provide the fulfillment center where the units were transferred back for our inventory monitoring purposes. If you do not have the capability to provide the downstream FC, please escalate the case to the Captive Team.   
+Thank you.`;  
+
+  const fnskuMap = {};  
+
+  // Populate FNSKU map  
+  data.forEach(row => {  
+    const fnsku = row[1];  
+    const quantity = row[3];  
+
+    if (!fnskuMap[fnsku]) {  
+      fnskuMap[fnsku] = { positive: [], negative: [] };  
+    }  
+
+    if (quantity > 0) {  
+      fnskuMap[fnsku].positive.push(row);  
+    } else {  
+      fnskuMap[fnsku].negative.push(row);  
+    }  
+  });  
+
+  // Helper function to format date as MM/DD/YYYY  
+  function formatDate(date) {  
+    if (date instanceof Date) {  
+      const day = String(date.getDate()).padStart(2, '0');  
+      const month = String(date.getMonth() + 1).padStart(2, '0');  
+      const year = date.getFullYear();  
+      return `${month}/${day}/${year}`;  
+    }  
+    return date;  
+  }  
+
+  // Process the data according to rules  
+  for (const fnsku in fnskuMap) {  
+    const { positive, negative } = fnskuMap[fnsku];  
+
+    const positiveMap = new Map();  
+    const negativeMap = new Map();  
+
+    positive.forEach(row => {  
+      const quantity = row[3];  
+      if (!positiveMap.has(quantity)) {  
+        positiveMap.set(quantity, []);  
+      }  
+      positiveMap.get(quantity).push(row);  
+    });  
+
+    negative.forEach(row => {  
+      const quantity = row[3];  
+      if (!negativeMap.has(quantity)) {  
+        negativeMap.set(quantity, []);  
+      }  
+      negativeMap.get(quantity).push(row);  
+    });  
+
+    // Check for matches and process accordingly  
+    negativeMap.forEach((negRows, negQuantity) => {  
+      const posQuantity = -negQuantity;  
+      if (positiveMap.has(posQuantity)) {  
+        const posRows = positiveMap.get(posQuantity);  
+
+        // Determine the number of matches  
+        const matchCount = Math.min(negRows.length, posRows.length);  
+
+        // Remove matched pairs  
+        negRows.splice(0, matchCount);  
+        posRows.splice(0, matchCount);  
+
+        if (negRows.length > 0) {  
+          const dataLines = negRows.map(row => {  
+            row[0] = formatDate(row[0]); // Format the date  
+            return row.slice(0, 7).join("\t");  
+          }).join("\n");  
+          const message = getTemplate1(counter).replace('*Insert Data Here*', dataLines);  
+          readySheet.appendRow([message]);  
+          counter++;
+        }  
+
+      } else {  
+        const dataLines = negRows.map(row => {  
+          row[0] = formatDate(row[0]); // Format the date  
+          return row.slice(0, 7).join("\t");  
+        }).join("\n");  
+        const message = getTemplate1(counter).replace('*Insert Data Here*', dataLines);  
+        readySheet.appendRow([message]);  
+        counter++;
+      }  
+    });  
+  }  
+}
+
+// Updated CSV Processor function with sequential processing and progress indicator
+function processCSVFilesFromDrive() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Create a sheet to track progress
+  let statusSheet = spreadsheet.getSheetByName("Processing Status");
+  if (!statusSheet) {
+    statusSheet = spreadsheet.insertSheet("Processing Status");
+    statusSheet.getRange("A1:C1").setValues([["File", "Status", "Order"]]);
+  }
+  
+  // Show file picker dialog with status indicator
+  const html = HtmlService.createHtmlOutput(`
+    <div id="uploadContainer">
+      <input type="file" id="files" multiple accept=".csv" onchange="processFiles(this.files)" />
+      <div id="status" style="margin-top: 10px; display: none;">
+        <p id="statusText" style="color: #666;">Processing files...</p>
+        <div style="width: 100%; height: 4px; background: #eee; border-radius: 2px;">
+          <div id="progressBar" style="width: 0%; height: 100%; background: #4CAF50; border-radius: 2px; transition: width 0.3s;"></div>
+        </div>
+      </div>
+      <div id="fileList" style="margin-top: 10px;"></div>
+    </div>
+    <script>
+      function processFiles(files) {
+        if (files.length === 0) return;
+        
+        document.getElementById('status').style.display = 'block';
+        document.getElementById('files').disabled = true;
+        
+        let processed = 0;
+        const totalFiles = files.length;
+        const fileList = Array.from(files);
+        
+        // Display selected files
+        const fileListDiv = document.getElementById('fileList');
+        fileListDiv.innerHTML = '<p style="color: #666;">Selected files in order:</p>' +
+          fileList.map((file, index) => 
+            '<div style="margin: 5px 0; color: #666;">' + (index + 1) + '. ' + file.name + '</div>'
+          ).join('');
+        
+        function updateProgress() {
+          const progress = (processed / totalFiles) * 100;
+          document.getElementById('progressBar').style.width = progress + '%';
+          document.getElementById('statusText').textContent = 
+            'Processing file ' + (processed + 1) + ' of ' + totalFiles;
+        }
+        
+        fileList.forEach((file, index) => {
+          const reader = new FileReader();
+          reader.onload = function(e) {
+            google.script.run
+              .withSuccessHandler(function() {
+                processed++;
+                updateProgress();
+                
+                if (processed === totalFiles) {
+                  google.script.run
+                    .withSuccessHandler(function() {
+                      document.getElementById('statusText').textContent = 'Processing completed!';
+                      document.getElementById('statusText').style.color = '#4CAF50';
+                      setTimeout(function() {
+                        google.script.host.close();
+                      }, 2000);
+                    })
+                    .processQueue();
+                }
+              })
+              .uploadCSV(file.name, e.target.result, index + 1);
+          };
+          reader.readAsText(file);
+        });
+      }
+    </script>
+    <style>
+      #uploadContainer {
+        padding: 20px;
+        font-family: Arial, sans-serif;
+      }
+      #files {
+        margin-bottom: 15px;
+      }
+      #status {
+        margin-top: 15px;
+      }
+      #statusText {
+        margin-bottom: 8px;
+        font-size: 14px;
+      }
+      #fileList {
+        margin-top: 15px;
+        font-size: 14px;
+      }
+    </style>
+  `).setWidth(400).setHeight(400);
+  
+  SpreadsheetApp.getUi().showModalDialog(html, 'Select CSV Files');
+}
+
+// Updated uploadCSV function with order parameter
+function uploadCSV(filename, content, order) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const statusSheet = spreadsheet.getSheetByName("Processing Status");
+  
+  // Add file to status sheet with order
+  statusSheet.appendRow([filename, "Queued", order]);
+  
+  // Create sheet for CSV data
+  let sheet = spreadsheet.getSheetByName(filename);
+  if (sheet) {
+    sheet.clear();
+  } else {
+    sheet = spreadsheet.insertSheet(filename);
+  }
+  
+  // Parse and write CSV data
+  const csvData = Utilities.parseCsv(content);
+  sheet.getRange(1, 1, csvData.length, csvData[0].length).setValues(csvData);
+}
+
+// Update the processQueue function to run cross-reference after processing
+function processQueue() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const statusSheet = spreadsheet.getSheetByName("Processing Status");
+  const queueData = statusSheet.getRange("A2:C" + statusSheet.getLastRow()).getValues();
+  
+  // Sort the queue by order
+  const sortedQueue = queueData
+    .map((row, index) => ({ filename: row[0], status: row[1], order: row[2] }))
+    .sort((a, b) => a.order - b.order);
+  
+  // Get reference to the lookup spreadsheet
+  const lookupSpreadsheet = SpreadsheetApp.openById('1-HtcVsqcFTMmZLveiuzzH0R4lxivHBxVrLgIbHzqNWk');
+  const lookupSheet = lookupSpreadsheet.getSheetByName('Ced WX - Oct Audit list');
+  const lookupData = lookupSheet.getRange('B:C').getValues();
+  
+  // Process files in order
+  for (let i = 0; i < sortedQueue.length; i++) {
+    const { filename, status } = sortedQueue[i];
+    if (status === "Queued") {
+      const rowIndex = queueData.findIndex(row => row[0] === filename) + 2;
+      statusSheet.getRange(rowIndex, 2).setValue("Processing");
+      processFile(filename, i + 1);
+      statusSheet.getRange(rowIndex, 2).setValue("Completed");
+    }
+  }
+  
+  // Run cross-reference after all files are processed
+  crossReferenceWithSource();
+  
+  // Clean up status sheet
+  Utilities.sleep(2000);
+  spreadsheet.deleteSheet(statusSheet);
+}
+  
+// Updated processFile function with new naming logic
+function processFile(filename, sequence) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(filename);
+  
+  sheet.activate();
+  macroName();
+  
+  const reviewSheet = spreadsheet.getSheetByName("REVIEW");
+  if (reviewSheet) {
+    spreadsheet.deleteSheet(reviewSheet);
+  }
+  
+  const readySheet = spreadsheet.getSheetByName("READY");
+  if (readySheet) {
+    // Get base name by removing .csv
+    let baseName = filename.replace('.csv', '').trim();
+    
+    // Look up the ID from reference spreadsheet
+    const lookupSpreadsheet = SpreadsheetApp.openById('1-HtcVsqcFTMmZLveiuzzH0R4lxivHBxVrLgIbHzqNWk');
+    const lookupSheet = lookupSpreadsheet.getSheetByName('Ced WX - Oct Audit list');
+    const lookupData = lookupSheet.getRange('B:C').getValues();
+    
+    let foundId = '';
+    for (let i = 0; i < lookupData.length; i++) {
+      if (lookupData[i][1] && lookupData[i][1].toString().trim() === baseName) {
+        foundId = lookupData[i][0].toString().trim();
+        break;
+      }
+    }
+    
+    // Construct new name
+    let newName = foundId ? `${foundId} ${baseName}` : baseName;
+    
+    // Ensure name is not too long
+    if (newName.length > 100) {
+      newName = newName.substring(0, 100);
+    }
+    
+    // Move the sheet to the correct position based on sequence
+    const sheets = spreadsheet.getSheets();
+    const currentPosition = sheets.findIndex(s => s.getName() === readySheet.getName()) + 1;
+    const desiredPosition = sequence;
+    
+    if (currentPosition !== desiredPosition) {
+      spreadsheet.moveActiveSheet(desiredPosition);
+    }
+    
+    readySheet.setName(newName);
+  }
+  
+  spreadsheet.deleteSheet(sheet);
+}
+
+// Updated makeCopies function with copy count selection
+function makeCopies() {
+  var ui = SpreadsheetApp.getUi();
+  var html = `
+    <div style="padding: 20px; font-family: Arial, sans-serif;">
+      <h3 style="margin-bottom: 20px;">Select Number of Copies</h3>
+      <div style="margin-bottom: 20px;">
+        <select id="copyCount" style="padding: 8px; width: 100%; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 4px;">
+          <option value="5">5 Copies</option>
+          <option value="10">10 Copies</option>
+          <option value="15">15 Copies</option>
+        </select>
+        <button onclick="createCopies()" style="width: 100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
+          Create Copies
+        </button>
+      </div>
+      <div id="status" style="display: none;">
+        <div style="margin-bottom: 10px;">
+          <span id="statusText">Creating copies...</span>
+          <div style="width: 100%; height: 4px; background: #eee; border-radius: 2px; margin-top: 5px;">
+            <div id="progressBar" style="width: 0%; height: 100%; background: #4CAF50; border-radius: 2px; transition: width 0.3s;"></div>
+          </div>
+        </div>
+      </div>
+      <div id="results" style="display: none; margin-top: 20px;">
+        <button onclick="openAllTabs()" style="width: 100%; padding: 10px; background-color: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer;">
+          Open All Copies
+        </button>
+      </div>
+    </div>
+    <script>
+      let links = [];
+      
+      function updateProgress(current, total) {
+        const progress = (current / total) * 100;
+        document.getElementById('progressBar').style.width = progress + '%';
+        document.getElementById('statusText').textContent = 
+          'Creating copy ' + current + ' of ' + total + '...';
+      }
+      
+      function createCopies() {
+        const count = parseInt(document.getElementById('copyCount').value);
+        document.getElementById('status').style.display = 'block';
+        document.getElementById('copyCount').disabled = true;
+        document.querySelector('button').disabled = true;
+        
+        google.script.run
+          .withSuccessHandler(function(result) {
+            links = result;
+            document.getElementById('statusText').textContent = 'All copies created successfully!';
+            document.getElementById('progressBar').style.width = '100%';
+            document.getElementById('results').style.display = 'block';
+          })
+          .withFailureHandler(function(error) {
+            document.getElementById('statusText').textContent = 'Error: ' + error;
+            document.getElementById('statusText').style.color = 'red';
+          })
+          .createMultipleCopies(count);
+      }
+      
+      function openAllTabs() {
+        links.forEach(function(link) {
+          window.open(link, '_blank');
+        });
+      }
+    </script>`;
+
+  var dialogBox = HtmlService.createHtmlOutput(html)
+      .setWidth(400)
+      .setHeight(300);
+  ui.showModalDialog(dialogBox, 'Create Multiple Copies');
+}
+
+function createMultipleCopies(count) {
+  var file = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
+  var date = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MM/dd");
+  var links = [];
+
+  for (var i = 1; i <= count; i++) {
+    var newName = `${date} MACRO ${i}`;
+    var newFile = file.makeCopy(newName);
+    newFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT);
+    links.push(newFile.getUrl());
+  }
+
+  return links;
+}
+
+// Add this new function for cross-referencing
+function crossReferenceWithSource() {
+  const currentSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSpreadsheet = SpreadsheetApp.openById('1M7aYhgr-gKe1nBGT7KvYQjdegUwEA4AZmmDJ7BsBQgM');
+  const sheets = currentSpreadsheet.getSheets();
+  
+  // Create a summary sheet with updated columns
+  let summarySheet = currentSpreadsheet.getSheetByName('Cross-Reference Summary');
+  if (summarySheet) {
+    currentSpreadsheet.deleteSheet(summarySheet);
+  }
+  summarySheet = currentSpreadsheet.insertSheet('Cross-Reference Summary');
+  summarySheet.getRange('A1:C1').setValues([['Sheet Name', 'Deleted Rows', 'Remaining Source Items']]);
+  
+  // Skip Sheet1
+  const sheetsToProcess = sheets.filter(sheet => sheet.getName() !== 'Sheet1' && 
+                                               sheet.getName() !== 'Cross-Reference Summary');
+  
+  let summaryRow = 2;
+  sheetsToProcess.forEach(sheet => {
+    const fullName = sheet.getName();
+    const baseName = fullName.replace(/^\d+\s*/, '');
+    
+    const sourceSheet = sourceSpreadsheet.getSheets()
+      .find(s => s.getName().trim() === baseName.trim());
+    
+    if (sourceSheet) {
+      const summary = crossReferenceSheets(sheet, sourceSheet);
+      
+      // Add sheet info to summary
+      summarySheet.getRange(summaryRow, 1, 1, 2).setValues([[
+        fullName,
+        summary.deletedCount
+      ]]);
+      
+      // Add remaining source items in separate columns
+      if (summary.remainingSourceRows.length > 0) {
+        const formattedData = summary.remainingSourceRows.map(item => [item.fnsku, item.quantity]);
+        summarySheet.getRange(summaryRow, 3, 1, 1).setValue(summary.remainingSourceRows.length + ' items:');
+        summarySheet.getRange(summaryRow, 4, formattedData.length, 2).setValues(formattedData);
+        summaryRow += Math.max(1, formattedData.length);
+      } else {
+        summarySheet.getRange(summaryRow, 3).setValue('No remaining items');
+        summaryRow++;
+      }
+    }
+  });
+  
+  // Format summary sheet
+  summarySheet.autoResizeColumns(1, 5);
+  summarySheet.getRange('A1:E1').setBackground('#f3f3f3').setFontWeight('bold');
+}
+
+function crossReferenceSheets(currentSheet, sourceSheet) {
+  try {
+    // Get data from source sheet
+    const sourceData = sourceSheet.getRange('A1:B' + sourceSheet.getLastRow()).getValues();
+    const referenceDataWithIndices = sourceData
+      .map((row, index) => ({
+        fnsku: row[0],
+        quantity: parseInt(row[1]),
+        rowIndex: index + 1,
+        originalRow: row
+      }))
+      .filter(item => item.fnsku && !isNaN(item.quantity) && item.quantity > 0);
+    
+    // Get all rows from current sheet
+    const currentData = currentSheet.getRange('A1:A' + currentSheet.getLastRow()).getValues();
+    
+    // Keep track of matched reference rows
+    const matchedRefIndices = new Set();
+    const deletedRows = [];
+    
+    // Process rows and decide which ones to keep
+    const processedRows = currentData.map((row, index) => {
+      const text = row[0];
+      
+      if (index === 0) {
+        const parsedData = parseTransferText(text);
+        if (!parsedData) return { text, keep: true };
+        
+        const absQuantity = Math.abs(parsedData.quantity);
+        const matchedRef = referenceDataWithIndices.find(ref => 
+          ref.fnsku === parsedData.fnsku && 
+          ref.quantity === absQuantity
+        );
+        if (matchedRef) {
+          matchedRefIndices.add(matchedRef.rowIndex);
+          deletedRows.push({ fnsku: parsedData.fnsku, quantity: absQuantity });
+        }
+        return { text, keep: !matchedRef };
+      }
+      
+      if (!text) return { text, keep: false };
+      
+      const parsedData = parseTransferText(text);
+      if (!parsedData) return { text, keep: true };
+      
+      const absQuantity = Math.abs(parsedData.quantity);
+      const matchedRef = referenceDataWithIndices.find(ref => 
+        ref.fnsku === parsedData.fnsku && 
+        ref.quantity === absQuantity &&
+        !matchedRefIndices.has(ref.rowIndex)
+      );
+      
+      if (matchedRef) {
+        matchedRefIndices.add(matchedRef.rowIndex);
+        deletedRows.push({ fnsku: parsedData.fnsku, quantity: absQuantity });
+      }
+      return { text, keep: !matchedRef };
+    });
+    
+    // Filter rows to keep
+    const remainingRows = processedRows
+      .filter(row => row.keep)
+      .map(row => [row.text]);
+    
+    // Clear and update current sheet
+    currentSheet.clearContents();
+    if (remainingRows.length > 0) {
+      currentSheet.getRange(1, 1, remainingRows.length, 1).setValues(remainingRows);
+      currentSheet.autoResizeColumn(1);
+    }
+    
+    // Delete matched rows from source sheet
+    if (matchedRefIndices.size > 0) {
+      const rowsToDelete = Array.from(matchedRefIndices).sort((a, b) => b - a);
+      rowsToDelete.forEach(rowIndex => {
+        sourceSheet.deleteRow(rowIndex);
+      });
+    }
+    
+    // Get remaining source data after deletions
+    const remainingSourceData = sourceSheet.getRange('A1:B' + sourceSheet.getLastRow())
+      .getValues()
+      .filter(row => row[0] && row[1])
+      .map(row => ({
+        fnsku: row[0],
+        quantity: row[1]
+      }));
+    
+    return {
+      deletedCount: matchedRefIndices.size,
+      deletedRows: deletedRows,
+      remainingSourceRows: remainingSourceData
+    };
+    
+  } catch (error) {
+    Logger.log('Error processing sheet ' + currentSheet.getName() + ': ' + error.toString());
+    return {
+      deletedCount: 0,
+      deletedRows: [],
+      remainingSourceRows: []
+    };
+  }
+}
+
+// Helper function to parse transfer text
+function parseTransferText(text) {
+  if (!text) return null;
+  
+  const lines = text.split('\n');
+  for (const line of lines) {
+    // Look for a line with tab-separated values
+    if (line.includes('\t')) {
+      const parts = line.split('\t');
+      if (parts.length >= 4) {
+        return {
+          fnsku: parts[1],
+          quantity: parseInt(parts[3])
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// Update the processQueue function to run cross-reference after processing
+function processQueue() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const statusSheet = spreadsheet.getSheetByName("Processing Status");
+  const queueData = statusSheet.getRange("A2:C" + statusSheet.getLastRow()).getValues();
+  
+  // Sort the queue by order
+  const sortedQueue = queueData
+    .map((row, index) => ({ filename: row[0], status: row[1], order: row[2] }))
+    .sort((a, b) => a.order - b.order);
+  
+  // Get reference to the lookup spreadsheet
+  const lookupSpreadsheet = SpreadsheetApp.openById('1-HtcVsqcFTMmZLveiuzzH0R4lxivHBxVrLgIbHzqNWk');
+  const lookupSheet = lookupSpreadsheet.getSheetByName('Ced WX - Oct Audit list');
+  const lookupData = lookupSheet.getRange('B:C').getValues();
+  
+  // Process files in order
+  for (let i = 0; i < sortedQueue.length; i++) {
+    const { filename, status } = sortedQueue[i];
+    if (status === "Queued") {
+      const rowIndex = queueData.findIndex(row => row[0] === filename) + 2;
+      statusSheet.getRange(rowIndex, 2).setValue("Processing");
+      processFile(filename, i + 1);
+      statusSheet.getRange(rowIndex, 2).setValue("Completed");
+    }
+  }
+  
+  // Run cross-reference after all files are processed
+  crossReferenceWithSource();
+  
+  // Clean up status sheet
+  Utilities.sleep(2000);
+  spreadsheet.deleteSheet(statusSheet);
+}
+
+function deleteSpecificSheets() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var sheetsToDelete = ["Sheet1", "Cross-Reference Summary"];
+  
+  // Iterate through sheets to delete
+  sheetsToDelete.forEach(function(sheetName) {
+    var sheet = spreadsheet.getSheetByName(sheetName);
+    
+    // Check if the sheet exists before trying to delete
+    if (sheet) {
+      spreadsheet.deleteSheet(sheet);
+    }
+  });
+}
+
+// Update the onOpen function to show the menu
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('CSV Processor')
+    .addItem('Upload and Process CSV Files', 'processCSVFilesFromDrive')
+    .addItem('Make Multiple Copies', 'makeCopies')
+    .addItem('Delete Specific Sheets', 'deleteSpecificSheets')
+    .addToUi();
+}
