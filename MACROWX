@@ -219,6 +219,7 @@ function makeCopies() {
           <option value="10">10 Copies</option>
           <option value="15">15 Copies</option>
         </select>
+        <input type="number" id="splitCount" placeholder="Split tabs into X" style="padding: 8px; width: 100%; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 4px;">
         <button onclick="createCopies()" style="width: 100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
           Create Copies
         </button>
@@ -249,8 +250,10 @@ function makeCopies() {
       
       function createCopies() {
         const count = parseInt(document.getElementById('copyCount').value);
+        const splitCount = parseInt(document.getElementById('splitCount').value);
         document.getElementById('status').style.display = 'block';
         document.getElementById('copyCount').disabled = true;
+        document.getElementById('splitCount').disabled = true;
         document.querySelector('button').disabled = true;
         
         google.script.run
@@ -264,7 +267,7 @@ function makeCopies() {
             document.getElementById('statusText').textContent = 'Error: ' + error;
             document.getElementById('statusText').style.color = 'red';
           })
-          .createMultipleCopies(count);
+          .createMultipleCopies(count, splitCount);
       }
       
       function openAllTabs() {
@@ -280,16 +283,46 @@ function makeCopies() {
   ui.showModalDialog(dialogBox, 'Create Multiple Copies');
 }
 
-function createMultipleCopies(count) {
-  var file = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
-  var date = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MM/dd");
-  var links = [];
-
-  for (var i = 1; i <= count; i++) {
-    var newName = `${date} MACRO ${i}`;
-    var newFile = file.makeCopy(newName);
+function createMultipleCopies(count, splitCount) {
+  const file = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
+  const date = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MM/dd");
+  const sheets = SpreadsheetApp.getActiveSpreadsheet().getSheets();
+  const links = [];
+  
+  for (let i = 0; i < count; i++) {
+    const newName = `${date} MACRO ${i + 1}`;
+    const newFile = file.makeCopy(newName);
     newFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT);
-    links.push(newFile.getUrl());
+    const newSpreadsheet = SpreadsheetApp.openById(newFile.getId());
+    
+    // Split the tabs into multiple gsheets
+    if (splitCount && splitCount > 0) {
+      const totalSheets = sheets.length;
+      const chunks = Math.ceil(totalSheets / splitCount);
+      
+      for (let j = 0; j < chunks; j++) {
+        const chunkName = `${newName} Part ${j + 1}`;
+        const chunkFile = file.makeCopy(chunkName);
+        chunkFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT);
+        const chunkSpreadsheet = SpreadsheetApp.openById(chunkFile.getId());
+        
+        // Copy the relevant sheets to chunkSpreadsheet
+        for (let k = j * splitCount; k < (j + 1) * splitCount && k < totalSheets; k++) {
+          const sheet = sheets[k].copyTo(chunkSpreadsheet);
+          sheet.setName(sheets[k].getName());
+        }
+        
+        // Remove default blank sheet
+        const defaultSheet = chunkSpreadsheet.getSheetByName('Sheet1');
+        if (defaultSheet) {
+          chunkSpreadsheet.deleteSheet(defaultSheet);
+        }
+        
+        links.push(chunkFile.getUrl());
+      }
+    } else {
+      links.push(newFile.getUrl());
+    }
   }
 
   return links;
