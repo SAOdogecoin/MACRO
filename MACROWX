@@ -1,3 +1,124 @@
+function macroName() {  
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();  
+  const rawSheet = sheet.getActiveSheet();  
+
+  const readySheet = sheet.getSheetByName("READY") || sheet.insertSheet("READY");  
+  const reviewSheet = sheet.getSheetByName("REVIEW") || sheet.insertSheet("REVIEW");  
+
+  readySheet.clear();  
+  reviewSheet.clear();  
+
+  const data = rawSheet.getDataRange().getValues();  
+  const headers = data.shift();  
+
+  // Initialize counter
+  let counter = 1;
+
+  const getTemplate1 = (count) => `**WAREHOUSE TRANSFER / TRANSSHIP**${String(count).padStart(2, '0')}  
+
+These units were transferred out but not received within the 60-day timeframe. Please proceed with the reimbursement process.  
+
+*Insert Data Here*  
+
+Note: If the inventory in question has been reconciled, please provide the fulfillment center where the units were transferred back for our inventory monitoring purposes. If you do not have the capability to provide the downstream FC, please escalate the case to the Captive Team.   
+Thank you.`;  
+
+  const getTemplate2 = (count) => `**WAREHOUSE TRANSFER / TRANSSHIP**${String(count).padStart(2, '0')}  
+
+Please see the data set below, there are more events for outgoing vs incoming for the same quantity, one or more of those outgoings were not received within the 60-day timeframe. Please proceed with the reimbursement process.  
+
+*Insert data here*  
+
+Note: If the inventory in question has been reconciled, please provide the fulfillment center where the units were transferred back for our inventory monitoring purposes. If you do not have the capability to provide the downstream FC, please escalate the case to the Captive Team.   
+Thank you.`;  
+
+  const fnskuMap = {};  
+
+  // Populate FNSKU map  
+  data.forEach(row => {  
+    const fnsku = row[1];  
+    const quantity = row[3];  
+
+    if (!fnskuMap[fnsku]) {  
+      fnskuMap[fnsku] = { positive: [], negative: [] };  
+    }  
+
+    if (quantity > 0) {  
+      fnskuMap[fnsku].positive.push(row);  
+    } else {  
+      fnskuMap[fnsku].negative.push(row);  
+    }  
+  });  
+
+  // Helper function to format date as MM/DD/YYYY  
+  function formatDate(date) {  
+    if (date instanceof Date) {  
+      const day = String(date.getDate()).padStart(2, '0');  
+      const month = String(date.getMonth() + 1).padStart(2, '0');  
+      const year = date.getFullYear();  
+      return `${month}/${day}/${year}`;  
+    }  
+    return date;  
+  }  
+
+  // Process the data according to rules  
+  for (const fnsku in fnskuMap) {  
+    const { positive, negative } = fnskuMap[fnsku];  
+
+    const positiveMap = new Map();  
+    const negativeMap = new Map();  
+
+    positive.forEach(row => {  
+      const quantity = row[3];  
+      if (!positiveMap.has(quantity)) {  
+        positiveMap.set(quantity, []);  
+      }  
+      positiveMap.get(quantity).push(row);  
+    });  
+
+    negative.forEach(row => {  
+      const quantity = row[3];  
+      if (!negativeMap.has(quantity)) {  
+        negativeMap.set(quantity, []);  
+      }  
+      negativeMap.get(quantity).push(row);  
+    });  
+
+    // Check for matches and process accordingly  
+    negativeMap.forEach((negRows, negQuantity) => {  
+      const posQuantity = -negQuantity;  
+      if (positiveMap.has(posQuantity)) {  
+        const posRows = positiveMap.get(posQuantity);  
+
+        // Determine the number of matches  
+        const matchCount = Math.min(negRows.length, posRows.length);  
+
+        // Remove matched pairs  
+        negRows.splice(0, matchCount);  
+        posRows.splice(0, matchCount);  
+
+        if (negRows.length > 0) {  
+          const dataLines = negRows.map(row => {  
+            row[0] = formatDate(row[0]); // Format the date  
+            return row.slice(0, 7).join("\t");  
+          }).join("\n");  
+          const message = getTemplate1(counter).replace('*Insert Data Here*', dataLines);  
+          readySheet.appendRow([message]);  
+          counter++;
+        }  
+
+      } else {  
+        const dataLines = negRows.map(row => {  
+          row[0] = formatDate(row[0]); // Format the date  
+          return row.slice(0, 7).join("\t");  
+        }).join("\n");  
+        const message = getTemplate1(counter).replace('*Insert Data Here*', dataLines);  
+        readySheet.appendRow([message]);  
+        counter++;
+      }  
+    });  
+  }  
+}
 
 // Updated CSV Processor function with sequential processing and progress indicator
 function processCSVFilesFromDrive() {
@@ -160,6 +281,7 @@ function processFile(filename, sequence) {
   const sheet = spreadsheet.getSheetByName(filename);
   
   sheet.activate();
+  macroName();
   
   const reviewSheet = spreadsheet.getSheetByName("REVIEW");
   if (reviewSheet) {
@@ -219,7 +341,6 @@ function makeCopies() {
           <option value="10">10 Copies</option>
           <option value="15">15 Copies</option>
         </select>
-        <input type="number" id="splitCount" placeholder="Split tabs into X" style="padding: 8px; width: 100%; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 4px;">
         <button onclick="createCopies()" style="width: 100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
           Create Copies
         </button>
@@ -250,10 +371,8 @@ function makeCopies() {
       
       function createCopies() {
         const count = parseInt(document.getElementById('copyCount').value);
-        const splitCount = parseInt(document.getElementById('splitCount').value);
         document.getElementById('status').style.display = 'block';
         document.getElementById('copyCount').disabled = true;
-        document.getElementById('splitCount').disabled = true;
         document.querySelector('button').disabled = true;
         
         google.script.run
@@ -267,7 +386,7 @@ function makeCopies() {
             document.getElementById('statusText').textContent = 'Error: ' + error;
             document.getElementById('statusText').style.color = 'red';
           })
-          .createMultipleCopies(count, splitCount);
+          .createMultipleCopies(count);
       }
       
       function openAllTabs() {
@@ -283,46 +402,16 @@ function makeCopies() {
   ui.showModalDialog(dialogBox, 'Create Multiple Copies');
 }
 
-function createMultipleCopies(count, splitCount) {
-  const file = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
-  const date = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MM/dd");
-  const sheets = SpreadsheetApp.getActiveSpreadsheet().getSheets();
-  const links = [];
-  
-  for (let i = 0; i < count; i++) {
-    const newName = `${date} MACRO ${i + 1}`;
-    const newFile = file.makeCopy(newName);
+function createMultipleCopies(count) {
+  var file = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
+  var date = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MM/dd");
+  var links = [];
+
+  for (var i = 1; i <= count; i++) {
+    var newName = `${date} MACRO ${i}`;
+    var newFile = file.makeCopy(newName);
     newFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT);
-    const newSpreadsheet = SpreadsheetApp.openById(newFile.getId());
-    
-    // Split the tabs into multiple gsheets
-    if (splitCount && splitCount > 0) {
-      const totalSheets = sheets.length;
-      const chunks = Math.ceil(totalSheets / splitCount);
-      
-      for (let j = 0; j < chunks; j++) {
-        const chunkName = `${newName} Part ${j + 1}`;
-        const chunkFile = file.makeCopy(chunkName);
-        chunkFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT);
-        const chunkSpreadsheet = SpreadsheetApp.openById(chunkFile.getId());
-        
-        // Copy the relevant sheets to chunkSpreadsheet
-        for (let k = j * splitCount; k < (j + 1) * splitCount && k < totalSheets; k++) {
-          const sheet = sheets[k].copyTo(chunkSpreadsheet);
-          sheet.setName(sheets[k].getName());
-        }
-        
-        // Remove default blank sheet
-        const defaultSheet = chunkSpreadsheet.getSheetByName('Sheet1');
-        if (defaultSheet) {
-          chunkSpreadsheet.deleteSheet(defaultSheet);
-        }
-        
-        links.push(chunkFile.getUrl());
-      }
-    } else {
-      links.push(newFile.getUrl());
-    }
+    links.push(newFile.getUrl());
   }
 
   return links;
