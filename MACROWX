@@ -1,655 +1,1707 @@
-function macroName() {  
-  const sheet = SpreadsheetApp.getActiveSpreadsheet();  
-  const rawSheet = sheet.getActiveSheet();  
-
-  const readySheet = sheet.getSheetByName("READY") || sheet.insertSheet("READY");  
-  const reviewSheet = sheet.getSheetByName("REVIEW") || sheet.insertSheet("REVIEW");  
-
-  readySheet.clear();  
-  reviewSheet.clear();  
-
-  const data = rawSheet.getDataRange().getValues();  
-  const headers = data.shift();  
-
-  // Initialize counter
-  let counter = 1;
-
-  const getTemplate1 = (count) => `**WAREHOUSE TRANSFER / TRANSSHIP**${String(count).padStart(2, '0')}  
-
-These units were transferred out but not received within the 60-day timeframe. Please proceed with the reimbursement process.  
-
-*Insert Data Here*  
-
-Note: If the inventory in question has been reconciled, please provide the fulfillment center where the units were transferred back for our inventory monitoring purposes. If you do not have the capability to provide the downstream FC, please escalate the case to the Captive Team.   
-Thank you.`;  
-
-  const getTemplate2 = (count) => `**WAREHOUSE TRANSFER / TRANSSHIP**${String(count).padStart(2, '0')}  
-
-Please see the data set below, there are more events for outgoing vs incoming for the same quantity, one or more of those outgoings were not received within the 60-day timeframe. Please proceed with the reimbursement process.  
-
-*Insert data here*  
-
-Note: If the inventory in question has been reconciled, please provide the fulfillment center where the units were transferred back for our inventory monitoring purposes. If you do not have the capability to provide the downstream FC, please escalate the case to the Captive Team.   
-Thank you.`;  
-
-  const fnskuMap = {};  
-
-  // Populate FNSKU map  
-  data.forEach(row => {  
-    const fnsku = row[1];  
-    const quantity = row[3];  
-
-    if (!fnskuMap[fnsku]) {  
-      fnskuMap[fnsku] = { positive: [], negative: [] };  
-    }  
-
-    if (quantity > 0) {  
-      fnskuMap[fnsku].positive.push(row);  
-    } else {  
-      fnskuMap[fnsku].negative.push(row);  
-    }  
-  });  
-
-  // Helper function to format date as MM/DD/YYYY  
-  function formatDate(date) {  
-    if (date instanceof Date) {  
-      const day = String(date.getDate()).padStart(2, '0');  
-      const month = String(date.getMonth() + 1).padStart(2, '0');  
-      const year = date.getFullYear();  
-      return `${month}/${day}/${year}`;  
-    }  
-    return date;  
-  }  
-
-  // Process the data according to rules  
-  for (const fnsku in fnskuMap) {  
-    const { positive, negative } = fnskuMap[fnsku];  
-
-    const positiveMap = new Map();  
-    const negativeMap = new Map();  
-
-    positive.forEach(row => {  
-      const quantity = row[3];  
-      if (!positiveMap.has(quantity)) {  
-        positiveMap.set(quantity, []);  
-      }  
-      positiveMap.get(quantity).push(row);  
-    });  
-
-    negative.forEach(row => {  
-      const quantity = row[3];  
-      if (!negativeMap.has(quantity)) {  
-        negativeMap.set(quantity, []);  
-      }  
-      negativeMap.get(quantity).push(row);  
-    });  
-
-    // Check for matches and process accordingly  
-    negativeMap.forEach((negRows, negQuantity) => {  
-      const posQuantity = -negQuantity;  
-      if (positiveMap.has(posQuantity)) {  
-        const posRows = positiveMap.get(posQuantity);  
-
-        // Determine the number of matches  
-        const matchCount = Math.min(negRows.length, posRows.length);  
-
-        // Remove matched pairs  
-        negRows.splice(0, matchCount);  
-        posRows.splice(0, matchCount);  
-
-        if (negRows.length > 0) {  
-          const dataLines = negRows.map(row => {  
-            row[0] = formatDate(row[0]); // Format the date  
-            return row.slice(0, 7).join("\t");  
-          }).join("\n");  
-          const message = getTemplate1(counter).replace('*Insert Data Here*', dataLines);  
-          readySheet.appendRow([message]);  
-          counter++;
-        }  
-
-      } else {  
-        const dataLines = negRows.map(row => {  
-          row[0] = formatDate(row[0]); // Format the date  
-          return row.slice(0, 7).join("\t");  
-        }).join("\n");  
-        const message = getTemplate1(counter).replace('*Insert Data Here*', dataLines);  
-        readySheet.appendRow([message]);  
-        counter++;
-      }  
-    });  
-  }  
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('CSV Import')
+    .addItem('Upload and Process RMS', 'showFileUploadDialog')
+    .addItem('Upload and Process WX', 'showCSVImportDialog')
+    .addItem('Create the WX Sheets', 'showDistributeDialog')
+    .addItem('Delete All Tabs Except Source', 'deleteAllTabsExceptSource')
+    .addItem('Run Full Process Sequence', 'runFullProcessSequence')
+    .addToUi();
 }
 
-// Updated CSV Processor function with sequential processing and progress indicator
-function processCSVFilesFromDrive() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  
-  // Create a sheet to track progress
-  let statusSheet = spreadsheet.getSheetByName("Processing Status");
-  if (!statusSheet) {
-    statusSheet = spreadsheet.insertSheet("Processing Status");
-    statusSheet.getRange("A1:C1").setValues([["File", "Status", "Order"]]);
-  }
-  
-  // Show file picker dialog with status indicator
-  const html = HtmlService.createHtmlOutput(`
-    <div id="uploadContainer">
-      <input type="file" id="files" multiple accept=".csv" onchange="processFiles(this.files)" />
-      <div id="status" style="margin-top: 10px; display: none;">
-        <p id="statusText" style="color: #666;">Processing files...</p>
-        <div style="width: 100%; height: 4px; background: #eee; border-radius: 2px;">
-          <div id="progressBar" style="width: 0%; height: 100%; background: #4CAF50; border-radius: 2px; transition: width 0.3s;"></div>
-        </div>
+///////////////////////RUN ALL MACRO//////////////////////////////
+
+function runFullProcessSequence() {
+  const htmlContent = `
+    <style>
+      body { font-family: Arial, sans-serif; padding: 20px; }
+      #progressContainer { margin: 20px 0; }
+      .step { margin-bottom: 15px; }
+      .step-title { font-weight: bold; }
+      .current { color: blue; }
+      .completed { color: green; }
+      .pending { color: gray; }
+      #fileInputContainer { margin: 20px 0; }
+      #status { margin: 15px 0; }
+      #completeButton { display: none; }
+      #openAllButton { display: none; margin-top: 10px; }
+      #urlListContainer { display: none; margin-top: 15px; }
+      #urlList { width: 100%; height: 100px; font-family: monospace; }
+      .action-buttons { margin-top: 15px; }
+      .action-buttons button { margin-right: 10px; }
+    </style>
+    
+    <h3>Complete Processing Sequence</h3>
+    
+    <div id="progressContainer">
+      <div class="step" id="step0">
+        <div class="step-title current">Prerequisite: Run Excel Macro</div>
+        <div class="step-description">You need to run the macro in your Excel file before proceeding</div>
       </div>
-      <div id="fileList" style="margin-top: 10px;"></div>
+      <div class="step" id="step1">
+        <div class="step-title pending">Step 1: Upload and Process RMS Files</div>
+        <div class="step-description pending">Select files ending with 1.csv or 11.csv</div>
+      </div>
+      <div class="step" id="step2">
+        <div class="step-title pending">Step 2: Process WX Files</div>
+        <div class="step-description pending">Files without number endings (automatically detected)</div>
+      </div>
+      <div class="step" id="step3">
+        <div class="step-title pending">Step 3: Distribute Tabs to New Sheets</div>
+        <div class="step-description pending">Configure distribution settings</div>
+      </div>
+      <div class="step" id="step4">
+        <div class="step-title pending">Step 4: Clean Up</div>
+        <div class="step-description pending">Delete all tabs except source</div>
+      </div>
     </div>
+    
+    <div id="prerequisiteContainer">
+      <div class="step-instructions">
+        <p>Before proceeding with the CSV file processing, you need to run the required macro in your Excel spreadsheet.</p>
+        <ol>
+          <li>Open your Excel spreadsheet</li>
+          <li>Run the macro to prepare your data</li>
+          <li>Save and close the Excel file</li>
+          <li>Return to this window and click the button below</li>
+        </ol>
+      </div>
+      <div class="action-buttons">
+        <button id="proceedToStep1Button" onclick="advanceToStep(1)" style="padding: 12px 24px; font-size: 16px; background-color: #4285f4; color: white; border: none; border-radius: 4px; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2);">I Already Ran the Excel Macro</button>
+      </div>
+    </div>
+    
+    <div id="fileInputContainer" style="display: none;">
+      <input type="file" id="files" name="files" multiple accept=".csv" style="display: none;">
+      <button id="selectFilesButton" onclick="document.getElementById('files').click()">Select All CSV Files</button>
+    </div>
+    
+    <div id="status"></div>
+    
+    <div id="configContainer" style="display: none;">
+      <h4>Distribution Settings</h4>
+      <div style="margin-bottom: 15px;">
+        <label for="tabsPerSheet" style="display: inline-block; width: 200px;">Tabs per new spreadsheet:</label>
+        <input type="number" id="tabsPerSheet" value="3" min="1" max="50" style="padding: 8px; width: 80px;">
+      </div>
+      <div style="margin-bottom: 20px;">
+        <label for="totalSheets" style="display: inline-block; width: 200px;">Maximum number of new spreadsheets:</label>
+        <input type="number" id="totalSheets" value="10" min="1" max="20" style="padding: 8px; width: 80px;">
+      </div>
+      <div class="action-buttons" style="margin-top: 20px;">
+        <button id="completeButton" onclick="distributeSheets()" style="padding: 12px 24px; font-size: 16px; background-color: #4285f4; color: white; border: none; border-radius: 4px; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2);">Create New Spreadsheets</button>
+      </div>
+    </div>
+    
+    <div class="action-buttons" style="display: flex; justify-content: space-between; margin-top: 20px; max-width: 500px;">
+      <button id="openAllButton" onclick="openAllSpreadsheets()" style="display: none; padding: 12px 24px; font-size: 16px; background-color: #34a853; color: white; border: none; border-radius: 4px; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); flex: 1; margin-right: 10px;">Open All Spreadsheets</button>
+      <button id="continueCleanupButton" onclick="advanceToStep(4)" style="display: none; padding: 12px 24px; font-size: 16px; background-color: #ea4335; color: white; border: none; border-radius: 4px; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); flex: 1;">Continue to Cleanup</button>
+    </div>
+    
+    <div id="urlListContainer" style="display: none;">
+      <h4>Created Spreadsheet URLs:</h4>
+      <textarea id="urlList" readonly></textarea>
+    </div>
+    
     <script>
-      function processFiles(files) {
-        if (files.length === 0) return;
-        
-        document.getElementById('status').style.display = 'block';
-        document.getElementById('files').disabled = true;
-        
-        let processed = 0;
-        const totalFiles = files.length;
-        const fileList = Array.from(files);
-        
-        // Display selected files
-        const fileListDiv = document.getElementById('fileList');
-        fileListDiv.innerHTML = '<p style="color: #666;">Selected files in order:</p>' +
-          fileList.map((file, index) => 
-            '<div style="margin: 5px 0; color: #666;">' + (index + 1) + '. ' + file.name + '</div>'
-          ).join('');
-        
-        function updateProgress() {
-          const progress = (processed / totalFiles) * 100;
-          document.getElementById('progressBar').style.width = progress + '%';
-          document.getElementById('statusText').textContent = 
-            'Processing file ' + (processed + 1) + ' of ' + totalFiles;
+      // Make sure elements are properly initialized when the page loads
+      window.onload = function() {
+        console.log("Page loaded, initializing UI...");
+        // Reset to step 0
+        advanceToStep(0);
+      }
+      
+      let currentStep = 0;
+      let allUploadedFiles = [];
+      let rmsFileQueue = [];
+      let wxFileQueue = [];
+      let isProcessing = false;
+      let processedCount = 0;
+      let totalFiles = 0;
+      let skippedFiles = 0;
+      let allProcessedData = [];
+      let createdSpreadsheets = [];
+      
+      document.getElementById('files').addEventListener('change', function(e) {
+        const files = this.files;
+        if (files && files.length > 0) {
+          allUploadedFiles = Array.from(files);
+          console.log("Total files uploaded: " + allUploadedFiles.length);
+          
+          if (currentStep === 1) {
+            handleAllFiles(allUploadedFiles);
+          }
+        } else {
+          updateStatus('No files selected.');
+        }
+      });
+      
+      function updateStatus(message) {
+        document.getElementById('status').innerHTML = message;
+        console.log("Status updated: " + message);
+      }
+      
+      function advanceToStep(step) {
+        console.log("Advancing to step: " + step);
+      
+        for (let i = 0; i <= 4; i++) {
+          const titleElement = document.querySelector('#step' + i + ' .step-title');
+          const descElement = document.querySelector('#step' + i + ' .step-description');
+          
+          if (i < step) {
+            titleElement.className = 'step-title completed';
+            if (descElement) descElement.className = 'step-description completed';
+          } else if (i === step) {
+            titleElement.className = 'step-title current';
+            if (descElement) descElement.className = 'step-description';
+          } else {
+            titleElement.className = 'step-title pending';
+            if (descElement) descElement.className = 'step-description pending';
+          }
         }
         
-        fileList.forEach((file, index) => {
-          const reader = new FileReader();
-          reader.onload = function(e) {
+        currentStep = step;
+        
+        if (step === 0) {
+          document.getElementById('prerequisiteContainer').style.display = 'block';
+          document.getElementById('fileInputContainer').style.display = 'none';
+          document.getElementById('configContainer').style.display = 'none';
+          document.getElementById('completeButton').style.display = 'none';
+          document.getElementById('openAllButton').style.display = 'none';
+          document.getElementById('continueCleanupButton').style.display = 'none';
+          document.getElementById('urlListContainer').style.display = 'none';
+        } else if (step === 1) {
+          document.getElementById('prerequisiteContainer').style.display = 'none';
+          document.getElementById('fileInputContainer').style.display = 'block';
+          document.getElementById('selectFilesButton').textContent = 'Select All CSV Files';
+          document.getElementById('selectFilesButton').style.display = 'block';
+          document.getElementById('configContainer').style.display = 'none';
+          document.getElementById('completeButton').style.display = 'none';
+          document.getElementById('openAllButton').style.display = 'none';
+          document.getElementById('continueCleanupButton').style.display = 'none';
+          document.getElementById('urlListContainer').style.display = 'none';
+          
+          // Add a debug message to confirm we reached this step
+          console.log("Step 1 activated, file input container should be visible");
+          updateStatus('Ready to process files. Please select all CSV files using the button below.');
+        } else if (step === 2) {
+          document.getElementById('prerequisiteContainer').style.display = 'none';
+          document.getElementById('fileInputContainer').style.display = 'none';
+          document.getElementById('selectFilesButton').style.display = 'none';
+          document.getElementById('continueCleanupButton').style.display = 'none';
+          // Process WX files automatically
+          processWXFiles();
+        } else if (step === 3) {
+          document.getElementById('prerequisiteContainer').style.display = 'none';
+          document.getElementById('fileInputContainer').style.display = 'none';
+          document.getElementById('selectFilesButton').style.display = 'none';
+          document.getElementById('configContainer').style.display = 'block';
+          document.getElementById('completeButton').style.display = 'block';
+          document.getElementById('openAllButton').style.display = 'none';
+          document.getElementById('continueCleanupButton').style.display = 'none';
+          document.getElementById('urlListContainer').style.display = 'none';
+        } else if (step === 4) {
+          document.getElementById('prerequisiteContainer').style.display = 'none';
+          document.getElementById('configContainer').style.display = 'none';
+          document.getElementById('completeButton').style.display = 'none';
+          deleteAllTabsExceptSource();
+        }
+      }
+      
+      function handleAllFiles(files) {
+        console.log("Handling all files, count: " + files.length);
+        
+        // First, filter out any files with _NoEligible in the name
+        const eligibleFiles = files.filter(file => {
+          if (file.name.includes("_NoEligible")) {
+            console.log("Skipping NoEligible file: " + file.name);
+            return false;
+          }
+          return true;
+        });
+        
+        console.log("Files after NoEligible filter: " + eligibleFiles.length);
+        
+        const fileGroups = {};
+        eligibleFiles.forEach(file => {
+          const fullName = file.name;
+          const baseName = fullName.replace(/\\.csv$/i, '').replace(/[0-9]*$/, '');
+          
+          if (!fileGroups[baseName]) {
+            fileGroups[baseName] = [];
+          }
+          fileGroups[baseName].push(file);
+          console.log("File " + fullName + " grouped under " + baseName);
+        });
+        
+        rmsFileQueue = [];
+        wxFileQueue = [];
+        
+        for (const baseName in fileGroups) {
+          const group = fileGroups[baseName];
+          
+          group.sort((a, b) => b.name.length - a.name.length);
+          
+          const endsWith1 = group.filter(file => file.name.match(/1\\.csv$/i));
+          const endsWith11 = group.filter(file => file.name.match(/11\\.csv$/i));
+          
+          if (endsWith11.length > 0) {
+            rmsFileQueue.push(endsWith11[0]);
+            console.log("Selected RMS file (11): " + endsWith11[0].name);
+          }
+          // Second priority: files ending with just 1.csv
+          else if (endsWith1.length > 0) {
+            rmsFileQueue.push(endsWith1[0]);
+            console.log("Selected RMS file (1): " + endsWith1[0].name);
+          }
+          
+          const wxCandidates = group.filter(file => {
+            const nameWithoutExt = file.name.replace(/\\.csv$/i, '');
+            return !nameWithoutExt.endsWith('1') && !nameWithoutExt.endsWith('11');
+          });
+          
+          if (wxCandidates.length > 0) {
+            wxFileQueue = wxFileQueue.concat(wxCandidates);
+            wxCandidates.forEach(file => {
+              console.log("Selected WX file: " + file.name);
+            });
+          }
+        }
+        
+        totalFiles = rmsFileQueue.length;
+        // Update skipped files count to include _NoEligible files
+        skippedFiles = files.length - totalFiles - wxFileQueue.length;
+        
+        updateStatus('Files categorized:<br>' + 
+                    '- RMS Files: ' + rmsFileQueue.length + '<br>' +
+                    '- WX Files: ' + wxFileQueue.length + '<br>' +
+                    '- Other Files: ' + skippedFiles + '<br>' +
+                    'Starting RMS file processing...');
+        
+        allProcessedData = [];
+        
+        if (rmsFileQueue.length > 0) {
+          processNextRMSFile();
+        } else {
+          updateStatus('No valid RMS files found. Skipping to WX files processing.');
+          advanceToStep(2);
+        }
+      }
+      
+      function processNextRMSFile() {
+        if (isProcessing) {
+          console.log("Already processing a file, waiting...");
+          return;
+        }
+        
+        if (rmsFileQueue.length === 0) {
+          console.log("All RMS files read. Sending to server...");
+          updateStatus('All RMS files read. Sending to server for processing...');
+          
+          console.log("Processed data count: " + (allProcessedData ? allProcessedData.length : 0));
+          
+          google.script.run
+            .withSuccessHandler((result) => {
+              console.log("Server processing complete:", result);
+              updateStatus('All ' + totalFiles + ' RMS files processed! Moving to WX files...');
+              // After a brief delay, advance to the next step
+              setTimeout(() => advanceToStep(2), 2000);
+            })
+            .withFailureHandler((error) => {
+              console.error("Server processing error:", error);
+              updateStatus('Error processing RMS files: ' + error);
+              // Allow user to try again
+              setTimeout(() => advanceToStep(1), 3000);
+            })
+            .updateSummarySheet(allProcessedData);
+          return;
+        }
+        
+        isProcessing = true;
+        const file = rmsFileQueue.shift();
+        processedCount++;
+        console.log("Processing file: " + file.name + " (" + processedCount + "/" + totalFiles + ")");
+        updateStatus('Processing RMS file: ' + file.name + ' (' + processedCount + '/' + totalFiles + ')');
+        
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          console.log("File read complete, sending to server: " + file.name);
+          google.script.run
+            .withSuccessHandler((processedData) => {
+              console.log("File processed successfully: " + file.name);
+              if (processedData && processedData.length > 0) {
+                console.log("Received " + processedData.length + " rows from server");
+                allProcessedData = allProcessedData.concat(processedData);
+              } else {
+                console.log("No data returned from server for this file");
+              }
+              isProcessing = false;
+              processNextRMSFile();
+            })
+            .withFailureHandler((error) => {
+              console.error('Error processing file ' + file.name + ':', error);
+              updateStatus('Error processing ' + file.name + ': ' + error);
+              isProcessing = false;
+              processNextRMSFile();
+            })
+            .processUploadedFile(e.target.result, file.name);
+        };
+        
+        reader.onerror = (e) => {
+          console.error('Error reading file ' + file.name + ':', e);
+          updateStatus('Error reading file ' + file.name);
+          isProcessing = false;
+          processNextRMSFile();
+        };
+        
+        try {
+          console.log("Starting to read file: " + file.name);
+          reader.readAsText(file);
+        } catch (e) {
+          console.error("Exception reading file: " + e);
+          updateStatus('Exception reading file ' + file.name + ': ' + e);
+          isProcessing = false;
+          processNextRMSFile();
+        }
+      }
+      
+      function processWXFiles() {
+        const totalWxFiles = wxFileQueue.length;
+        
+        updateStatus('Processing ' + totalWxFiles + ' WX files...');
+        
+        if (totalWxFiles === 0) {
+          updateStatus('No WX files to process. Moving to next step...');
+          setTimeout(() => advanceToStep(3), 2000);
+          return;
+        }
+        
+        const fileData = [];
+        const processNextFile = (index) => {
+          if (index >= wxFileQueue.length) {
+            // All files read, send to server
+            updateStatus('All WX files read. Sending to server for processing...');
+            
             google.script.run
-              .withSuccessHandler(function() {
-                processed++;
-                updateProgress();
-                
-                if (processed === totalFiles) {
-                  google.script.run
-                    .withSuccessHandler(function() {
-                      document.getElementById('statusText').textContent = 'Processing completed!';
-                      document.getElementById('statusText').style.color = '#4CAF50';
-                      setTimeout(function() {
-                        google.script.host.close();
-                      }, 2000);
-                    })
-                    .processQueue();
+              .withSuccessHandler(function(result) {
+                let message = 'WX Processing complete!<br>';
+                if (result && result.success && result.success.length > 0) {
+                  message += '<br>Successfully processed ' + result.success.length + ' files.<br>';
                 }
+                if (result && result.errors && result.errors.length > 0) {
+                  message += '<br>Errors:<br>';
+                  result.errors.forEach(error => {
+                    message += '- ' + error.file + ': ' + error.error + '<br>';
+                  });
+                }
+                updateStatus(message);
+                
+                // Automatically advance to the next step
+                setTimeout(() => advanceToStep(3), 2000);
               })
-              .uploadCSV(file.name, e.target.result, index + 1);
+              .withFailureHandler(function(error) {
+                updateStatus('Server error processing WX files: ' + error);
+                // Allow user to try again
+                setTimeout(() => advanceToStep(2), 3000);
+              })
+              .processCSVFiles(fileData);
+            return;
+          }
+          
+          const file = wxFileQueue[index];
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            fileData.push({
+              name: file.name,
+              content: e.target.result
+            });
+            updateStatus('Processing WX file: ' + file.name + ' (' + (index + 1) + '/' + wxFileQueue.length + ')');
+            processNextFile(index + 1);
+          };
+          reader.onerror = (e) => {
+            console.error('Error reading file ' + file.name + ':', e);
+            updateStatus('Error reading file ' + file.name + '. Skipping.');
+            processNextFile(index + 1);
           };
           reader.readAsText(file);
+        };
+        
+        processNextFile(0);
+      }
+      
+      function distributeSheets() {
+        const tabsPerSheet = parseInt(document.getElementById('tabsPerSheet').value) || 3;
+        const totalSheets = parseInt(document.getElementById('totalSheets').value) || 10;
+        
+        updateStatus('Starting distribution of tabs to new spreadsheets...');
+        
+        google.script.run
+          .withSuccessHandler(function(result) {
+            if (result && result.success) {
+              createdSpreadsheets = result.newSpreadsheets || [];
+              
+              let message = '<strong>Distribution complete!</strong><br><br>';
+              message += 'Created ' + createdSpreadsheets.length + ' new spreadsheets:<br>';
+              
+              let urlList = '';
+              createdSpreadsheets.forEach(ss => {
+                message += '<br>- <a href="' + ss.url + '" target="_blank">' + ss.name + '</a> (' + ss.tabs.length + ' tabs)';
+                urlList += ss.url + '\\n';
+              });
+              
+              updateStatus(message);
+              
+              document.getElementById('urlList').value = urlList;
+              document.getElementById('urlListContainer').style.display = 'block';
+              
+              document.getElementById('openAllButton').style.display = 'inline-block';
+              document.getElementById('continueCleanupButton').style.display = 'inline-block';
+              document.getElementById('completeButton').style.display = 'none';
+            } else {
+              updateStatus('Error during distribution: ' + (result && result.errors ? result.errors.join(', ') : 'Unknown error'));
+            }
+          })
+          .withFailureHandler(function(error) {
+            updateStatus('Server error during distribution: ' + error);
+          })
+          .distributeTabs({
+            tabsPerSheet: tabsPerSheet,
+            totalSheets: totalSheets,
+            skipPermissionWarnings: true // Skip permission warnings
+          });
+      }
+      
+      function openAllSpreadsheets() {
+        if (createdSpreadsheets.length === 0) {
+          updateStatus('No spreadsheets to open.');
+          return;
+        }
+        
+        createdSpreadsheets.forEach(ss => {
+          window.open(ss.url, '_blank');
         });
       }
+      
+      function deleteAllTabsExceptSource() {
+        updateStatus('Cleaning up: Deleting all tabs except source...');
+        
+        google.script.run
+          .withSuccessHandler(function(result) {
+            let message = '<strong>Cleanup complete!</strong><br><br>';
+            message += 'Deleted ' + result.deletedTabs + ' tabs, kept ' + result.remainingTabs + ' source tabs.';
+            updateStatus(message);
+            
+            // Process is fully complete
+            document.getElementById('openAllButton').style.display = 'inline-block';
+          })
+          .withFailureHandler(function(error) {
+            updateStatus('Error during cleanup: ' + error);
+          })
+          .deleteAllTabsExceptSource();
+      }
     </script>
-    <style>
-      #uploadContainer {
-        padding: 20px;
-        font-family: Arial, sans-serif;
+  `;
+  
+  const html = HtmlService.createHtmlOutput(htmlContent)
+    .setWidth(600)
+    .setHeight(650)
+    .setTitle('Complete Processing Sequence');
+  
+  SpreadsheetApp.getUi().showModalDialog(html, 'Complete Processing Sequence');
+}
+
+function openExcelFile() {
+  try {
+    // This is a placeholder function - Google Apps Script cannot directly open Excel
+    // In a real implementation, you might use a URL to a file in Drive or another method
+    
+    // You could potentially open a URL to a known Excel file location
+    // var file = DriveApp.getFilesByName("YourExcelFile.xlsx").next();
+    // if (file) {
+    //   return {
+    //     success: true,
+    //     url: file.getUrl()
+    //   };
+    // }
+    
+    // For now, we'll just return success and assume the user will open Excel manually
+    return {
+      success: true,
+      message: "Please open Excel manually if it didn't open automatically"
+    };
+  } catch (e) {
+    console.error("Error in openExcelFile: " + e);
+    return {
+      success: false,
+      error: e.toString()
+    };
+  }
+}
+
+function deleteAllTabsExceptSource() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  const sourceTabs = [];
+  const tabsToDelete = [];
+  
+  sheets.forEach(sheet => {
+    const sheetName = sheet.getName().toLowerCase();
+    if (sheetName === 'source' || sheetName.includes('source')) {
+      sourceTabs.push(sheet);
+    } else {
+      tabsToDelete.push(sheet);
+    }
+  });
+  
+  tabsToDelete.forEach(sheet => {
+    ss.deleteSheet(sheet);
+  });
+  
+  return {
+    success: true,
+    deletedTabs: tabsToDelete.length,
+    remainingTabs: sourceTabs.length
+  };
+}
+
+function distributeTabs(options) {
+  const skipPermissionWarnings = options.skipPermissionWarnings || false;
+  
+}
+
+/////////////////////////// RMS PROCESS ///////////////////////////
+
+function showFileUploadDialog() {
+  const html = HtmlService.createHtmlOutput(`
+    <form>
+      <input type="file" id="files" name="files" multiple accept=".csv" onchange="handleFiles(this.files)">
+    </form>
+    <div id="status"></div>
+    <script>
+      let fileQueue = [];
+      let isProcessing = false;
+      let processedCount = 0;
+      let totalFiles = 0;
+      let skippedFiles = 0;
+      let allProcessedData = [];
+      
+      function updateStatus(message) {
+        document.getElementById('status').innerHTML = message;
       }
-      #files {
-        margin-bottom: 15px;
+      
+      function handleFiles(files) {
+        // Group files by base name (remove extensions and trailing numbers)
+        const fileGroups = {};
+        Array.from(files).forEach(file => {
+          // Extract base name without extension
+          const fullName = file.name;
+          const baseName = fullName.replace(/\\.csv$/, '').replace(/[0-9]*$/, '');
+          
+          if (!fileGroups[baseName]) {
+            fileGroups[baseName] = [];
+          }
+          fileGroups[baseName].push(file);
+        });
+        
+        // For each group, select the appropriate file
+        fileQueue = [];
+        for (const baseName in fileGroups) {
+          const group = fileGroups[baseName];
+          // Sort files: WOW11.csv should come before WOW1.csv
+          group.sort((a, b) => b.name.length - a.name.length);
+          
+          // Find files that end with 1.csv or 11.csv
+          const matchingFiles = group.filter(file => 
+            file.name.match(/1+\\.csv$/) && !file.name.match(/[2-9]\\d*\\.csv$/)
+          );
+          
+          if (matchingFiles.length > 0) {
+            // Use the file with the longer name if there are multiple matches (e.g., prefer WOW11.csv over WOW1.csv)
+            fileQueue.push(matchingFiles[0]);
+          }
+        }
+        
+        totalFiles = fileQueue.length;
+        skippedFiles = Array.from(files).length - totalFiles;
+        
+        updateStatus('Files filtered. Found ' + totalFiles + ' valid files, skipped ' + 
+                    skippedFiles + ' files. Starting processing...');
+        
+        // Reset processed data array
+        allProcessedData = [];
+        
+        processNextFile();
       }
-      #status {
-        margin-top: 15px;
+      
+      function processNextFile() {
+        if (isProcessing) return;
+        
+        if (fileQueue.length === 0) {
+          // Send all processed data at once
+          google.script.run
+            .withSuccessHandler(() => {
+              updateStatus('All ' + totalFiles + ' files processed! Skipped ' + skippedFiles + ' files.');
+              google.script.run.showCompletionMessage(totalFiles, skippedFiles);
+            })
+            .updateSummarySheet(allProcessedData);
+          return;
+        }
+        
+        isProcessing = true;
+        const file = fileQueue.shift();
+        processedCount++;
+        updateStatus('Processing: ' + file.name + ' (' + processedCount + '/' + totalFiles + ')');
+        
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          google.script.run
+            .withSuccessHandler((processedData) => {
+              // Add processed data to our collection
+              if (processedData && processedData.length > 0) {
+                allProcessedData = allProcessedData.concat(processedData);
+              }
+              isProcessing = false;
+              processNextFile();
+            })
+            .withFailureHandler((error) => {
+              console.error('Error:', error);
+              isProcessing = false;
+              processNextFile();
+            })
+            .processUploadedFile(e.target.result, file.name);
+        };
+        reader.readAsText(file);
       }
-      #statusText {
-        margin-bottom: 8px;
-        font-size: 14px;
-      }
-      #fileList {
-        margin-top: 15px;
-        font-size: 14px;
-      }
-    </style>
-  `).setWidth(400).setHeight(400);
+    </script>
+  `)
+  .setWidth(400)
+  .setHeight(150);
   
   SpreadsheetApp.getUi().showModalDialog(html, 'Select CSV Files');
 }
 
-// Updated uploadCSV function with order parameter
-function uploadCSV(filename, content, order) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const statusSheet = spreadsheet.getSheetByName("Processing Status");
+function processUploadedFile(csvContent, filename) {
+  // Parse CSV content
+  const rows = Utilities.parseCsv(csvContent);
   
-  // Add file to status sheet with order
-  statusSheet.appendRow([filename, "Queued", order]);
+  // Clean up the filename to use as merchant name
+  let merchantName = filename.replace('.csv', '');
+  merchantName = merchantName.replace(/[0-9]+$/, ''); // Remove all trailing numbers
   
-  // Create sheet for CSV data
-  let sheet = spreadsheet.getSheetByName(filename);
-  if (sheet) {
-    sheet.clear();
+  // Filter the data
+  const filteredData = filterCustomerServiceIssue(rows, merchantName);
+  
+  // Return the filtered data to be collected in the client-side script
+  return filteredData;
+}
+
+function filterCustomerServiceIssue(rows, merchantName) {
+  // Filter values based on "CustomerServiceIssue" in column E (index 4)
+  const filtered = rows
+    .filter(row => {
+      // Make sure the row has enough columns and the value at index 4 exists
+      return row.length > 4 && row[4] === 'CustomerServiceIssue' && row.length > 2 && row[2];
+    })
+    .map(row => {
+      // Make sure the indices 6 and 15 exist before accessing them
+      const fnsku = row.length > 6 ? row[6] : '';
+      const qty = row.length > 15 ? row[15] : 0;
+      return [merchantName, fnsku, qty];
+    });
+  
+  // Log for debugging
+  Logger.log("Filtered " + filtered.length + " rows from " + merchantName);
+  return filtered;
+}
+
+function showCompletionMessage(totalFiles, skippedFiles) {
+  SpreadsheetApp.getUi().alert('Processing complete! ' + totalFiles + ' files have been processed. ' + 
+                              skippedFiles + ' files were skipped.');
+}
+
+function updateSummarySheet(allData) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let summarySheet = ss.getSheetByName('Source');
+  
+  // Create Summary sheet if it doesn't exist
+  if (!summarySheet) {
+    summarySheet = ss.insertSheet('Source');
   } else {
-    sheet = spreadsheet.insertSheet(filename);
+    // Clear existing content
+    summarySheet.clear();
   }
   
-  // Parse and write CSV data
-  const csvData = Utilities.parseCsv(content);
-  sheet.getRange(1, 1, csvData.length, csvData[0].length).setValues(csvData);
-}
-
-// Update the processQueue function to run cross-reference after processing
-function processQueue() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const statusSheet = spreadsheet.getSheetByName("Processing Status");
-  const queueData = statusSheet.getRange("A2:C" + statusSheet.getLastRow()).getValues();
+  // Headers
+  summarySheet.getRange(1, 1, 1, 3).setValues([['CSV Name', 'FNSKU', 'Quantity']]);
   
-  // Sort the queue by order
-  const sortedQueue = queueData
-    .map((row, index) => ({ filename: row[0], status: row[1], order: row[2] }))
-    .sort((a, b) => a.order - b.order);
+  // Log for debugging
+  Logger.log("Received " + allData.length + " rows to process for summary");
   
-  // Get reference to the lookup spreadsheet
-  const lookupSpreadsheet = SpreadsheetApp.openById('1-HtcVsqcFTMmZLveiuzzH0R4lxivHBxVrLgIbHzqNWk');
-  const lookupSheet = lookupSpreadsheet.getSheetByName('Ced WX - Oct Audit list');
-  const lookupData = lookupSheet.getRange('B:C').getValues();
-  
-  // Process files in order
-  for (let i = 0; i < sortedQueue.length; i++) {
-    const { filename, status } = sortedQueue[i];
-    if (status === "Queued") {
-      const rowIndex = queueData.findIndex(row => row[0] === filename) + 2;
-      statusSheet.getRange(rowIndex, 2).setValue("Processing");
-      processFile(filename, i + 1);
-      statusSheet.getRange(rowIndex, 2).setValue("Completed");
-    }
+  if (allData.length === 0) {
+    Logger.log("No data to process for summary sheet");
+    return;
   }
   
-  // Run cross-reference after all files are processed
-  crossReferenceWithSource();
-  
-  // Clean up status sheet
-  Utilities.sleep(2000);
-  spreadsheet.deleteSheet(statusSheet);
-}
-  
-// Updated processFile function with new naming logic
-function processFile(filename, sequence) {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = spreadsheet.getSheetByName(filename);
-  
-  sheet.activate();
-  macroName();
-  
-  const reviewSheet = spreadsheet.getSheetByName("REVIEW");
-  if (reviewSheet) {
-    spreadsheet.deleteSheet(reviewSheet);
-  }
-  
-  const readySheet = spreadsheet.getSheetByName("READY");
-  if (readySheet) {
-    // Get base name by removing .csv
-    let baseName = filename.replace('.csv', '').trim();
+  // Group by CSV Name and FNSKU
+  const groupedData = {};
+  allData.forEach(row => {
+    const merchant = row[0];
+    const fnsku = row[1];
+    const qty = parseFloat(row[2]) || 0;
     
-    // Look up the ID from reference spreadsheet
-    const lookupSpreadsheet = SpreadsheetApp.openById('1-HtcVsqcFTMmZLveiuzzH0R4lxivHBxVrLgIbHzqNWk');
-    const lookupSheet = lookupSpreadsheet.getSheetByName('Ced WX - Oct Audit list');
-    const lookupData = lookupSheet.getRange('B:C').getValues();
+    const key = `${merchant}_${fnsku}`;
     
-    let foundId = '';
-    for (let i = 0; i < lookupData.length; i++) {
-      if (lookupData[i][1] && lookupData[i][1].toString().trim() === baseName) {
-        foundId = lookupData[i][0].toString().trim();
-        break;
-      }
-    }
-    
-    // Construct new name
-    let newName = foundId ? `${foundId} ${baseName}` : baseName;
-    
-    // Ensure name is not too long
-    if (newName.length > 100) {
-      newName = newName.substring(0, 100);
-    }
-    
-    // Move the sheet to the correct position based on sequence
-    const sheets = spreadsheet.getSheets();
-    const currentPosition = sheets.findIndex(s => s.getName() === readySheet.getName()) + 1;
-    const desiredPosition = sequence;
-    
-    if (currentPosition !== desiredPosition) {
-      spreadsheet.moveActiveSheet(desiredPosition);
-    }
-    
-    readySheet.setName(newName);
-  }
-  
-  spreadsheet.deleteSheet(sheet);
-}
-
-// Updated makeCopies function with copy count selection
-function makeCopies() {
-  var ui = SpreadsheetApp.getUi();
-  var html = `
-    <div style="padding: 20px; font-family: Arial, sans-serif;">
-      <h3 style="margin-bottom: 20px;">Select Number of Copies</h3>
-      <div style="margin-bottom: 20px;">
-        <select id="copyCount" style="padding: 8px; width: 100%; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 4px;">
-          <option value="5">5 Copies</option>
-          <option value="10">10 Copies</option>
-          <option value="15">15 Copies</option>
-        </select>
-        <button onclick="createCopies()" style="width: 100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
-          Create Copies
-        </button>
-      </div>
-      <div id="status" style="display: none;">
-        <div style="margin-bottom: 10px;">
-          <span id="statusText">Creating copies...</span>
-          <div style="width: 100%; height: 4px; background: #eee; border-radius: 2px; margin-top: 5px;">
-            <div id="progressBar" style="width: 0%; height: 100%; background: #4CAF50; border-radius: 2px; transition: width 0.3s;"></div>
-          </div>
-        </div>
-      </div>
-      <div id="results" style="display: none; margin-top: 20px;">
-        <button onclick="openAllTabs()" style="width: 100%; padding: 10px; background-color: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer;">
-          Open All Copies
-        </button>
-      </div>
-    </div>
-    <script>
-      let links = [];
-      
-      function updateProgress(current, total) {
-        const progress = (current / total) * 100;
-        document.getElementById('progressBar').style.width = progress + '%';
-        document.getElementById('statusText').textContent = 
-          'Creating copy ' + current + ' of ' + total + '...';
-      }
-      
-      function createCopies() {
-        const count = parseInt(document.getElementById('copyCount').value);
-        document.getElementById('status').style.display = 'block';
-        document.getElementById('copyCount').disabled = true;
-        document.querySelector('button').disabled = true;
-        
-        google.script.run
-          .withSuccessHandler(function(result) {
-            links = result;
-            document.getElementById('statusText').textContent = 'All copies created successfully!';
-            document.getElementById('progressBar').style.width = '100%';
-            document.getElementById('results').style.display = 'block';
-          })
-          .withFailureHandler(function(error) {
-            document.getElementById('statusText').textContent = 'Error: ' + error;
-            document.getElementById('statusText').style.color = 'red';
-          })
-          .createMultipleCopies(count);
-      }
-      
-      function openAllTabs() {
-        links.forEach(function(link) {
-          window.open(link, '_blank');
-        });
-      }
-    </script>`;
-
-  var dialogBox = HtmlService.createHtmlOutput(html)
-      .setWidth(400)
-      .setHeight(300);
-  ui.showModalDialog(dialogBox, 'Create Multiple Copies');
-}
-
-function createMultipleCopies(count) {
-  var file = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
-  var date = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MM/dd");
-  var links = [];
-
-  for (var i = 1; i <= count; i++) {
-    var newName = `${date} MACRO ${i}`;
-    var newFile = file.makeCopy(newName);
-    newFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.EDIT);
-    links.push(newFile.getUrl());
-  }
-
-  return links;
-}
-
-// Add this new function for cross-referencing
-function crossReferenceWithSource() {
-  const currentSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const sourceSpreadsheet = SpreadsheetApp.openById('1M7aYhgr-gKe1nBGT7KvYQjdegUwEA4AZmmDJ7BsBQgM');
-  const sheets = currentSpreadsheet.getSheets();
-  
-  // Create a summary sheet with updated columns
-  let summarySheet = currentSpreadsheet.getSheetByName('Cross-Reference Summary');
-  if (summarySheet) {
-    currentSpreadsheet.deleteSheet(summarySheet);
-  }
-  summarySheet = currentSpreadsheet.insertSheet('Cross-Reference Summary');
-  summarySheet.getRange('A1:C1').setValues([['Sheet Name', 'Deleted Rows', 'Remaining Source Items']]);
-  
-  // Skip Sheet1
-  const sheetsToProcess = sheets.filter(sheet => sheet.getName() !== 'Sheet1' && 
-                                               sheet.getName() !== 'Cross-Reference Summary');
-  
-  let summaryRow = 2;
-  sheetsToProcess.forEach(sheet => {
-    const fullName = sheet.getName();
-    const baseName = fullName.replace(/^\d+\s*/, '');
-    
-    const sourceSheet = sourceSpreadsheet.getSheets()
-      .find(s => s.getName().trim() === baseName.trim());
-    
-    if (sourceSheet) {
-      const summary = crossReferenceSheets(sheet, sourceSheet);
-      
-      // Add sheet info to summary
-      summarySheet.getRange(summaryRow, 1, 1, 2).setValues([[
-        fullName,
-        summary.deletedCount
-      ]]);
-      
-      // Add remaining source items in separate columns
-      if (summary.remainingSourceRows.length > 0) {
-        const formattedData = summary.remainingSourceRows.map(item => [item.fnsku, item.quantity]);
-        summarySheet.getRange(summaryRow, 3, 1, 1).setValue(summary.remainingSourceRows.length + ' items:');
-        summarySheet.getRange(summaryRow, 4, formattedData.length, 2).setValues(formattedData);
-        summaryRow += Math.max(1, formattedData.length);
-      } else {
-        summarySheet.getRange(summaryRow, 3).setValue('No remaining items');
-        summaryRow++;
-      }
+    if (!groupedData[key]) {
+      groupedData[key] = [merchant, fnsku, qty];
+    } else {
+      groupedData[key][2] += qty;
     }
   });
   
-  // Format summary sheet
-  summarySheet.autoResizeColumns(1, 5);
-  summarySheet.getRange('A1:E1').setBackground('#f3f3f3').setFontWeight('bold');
+  // Write to summary sheet
+  const summaryData = Object.values(groupedData);
+  if (summaryData.length > 0) {
+    Logger.log("Writing " + summaryData.length + " rows to summary sheet");
+    summarySheet.getRange(2, 1, summaryData.length, 3).setValues(summaryData);
+  }
+  
+  // Auto-resize columns
+  summarySheet.autoResizeColumns(1, 3);
+  
+  // Return to sheet
+  ss.setActiveSheet(summarySheet);
 }
 
-function crossReferenceSheets(currentSheet, sourceSheet) {
+///////////////////// UPLOAD CSV for WX //////////////////////
+
+function showCSVImportDialog(previousFiles) {
+  var html = HtmlService.createHtmlOutput("")
+    .setWidth(600)
+    .setHeight(500)
+    .setTitle("Import CSV Files - Step 2: Select WX Files");
+    
+  html.append("<!DOCTYPE html>");
+  html.append("<html>");
+  html.append("<head>");
+  html.append("<base target=\"_top\">");
+  html.append("<style>");
+  html.append("body { font-family: Arial, sans-serif; margin: 10px; }");
+  html.append(".button { background-color: #4285f4; color: white; border: none; padding: 8px 16px; ");
+  html.append("  border-radius: 4px; cursor: pointer; font-size: 14px; margin-right: 8px; margin-bottom: 8px; }");
+  html.append(".button:hover { background-color: #2a75f3; }");
+  html.append(".textarea { width: 100%; height: 100px; font-family: monospace; margin-top: 10px; }");
+  html.append("</style>");
+  html.append("</head>");
+  html.append("<body>");
+  
+  html.append("<form>");
+  html.append("<div style=\"margin-bottom: 15px;\">");
+  html.append("<label for=\"files\" style=\"display: block; margin-bottom: 5px; font-weight: bold;\">Select CSV Files:</label>");
+  html.append("<input type=\"file\" id=\"files\" name=\"files\" multiple accept=\".csv\" onchange=\"handleFiles(this.files)\">");
+  html.append("</div>");
+  html.append("<div id=\"status\" style=\"margin-top: 10px;\"></div>");
+  html.append("<div id=\"fileList\" style=\"margin-top: 10px; max-height: 150px; overflow-y: auto;\"></div>");
+  html.append("<div id=\"buttonsContainer\" style=\"margin-top: 15px;\"></div>");
+  html.append("<div id=\"urlsContainer\" style=\"margin-top: 15px; display: none;\">");
+  html.append("<label for=\"spreadsheetUrls\" style=\"display: block; margin-bottom: 5px; font-weight: bold;\">Created Spreadsheet URLs:</label>");
+  html.append("<textarea id=\"spreadsheetUrls\" class=\"textarea\" readonly></textarea>");
+  html.append("</div>");
+  html.append("</form>");
+  
+  html.append("<script>");
+  html.append("var fileQueue = [];");
+  html.append("var isProcessing = false;");
+  html.append("var processedCount = 0;");
+  html.append("var totalFiles = 0;");
+  html.append("var skippedFiles = 0;");
+  html.append("var createdSpreadsheetIds = [];");
+  
+  // If we have previous files passed from Step 1
+  if (previousFiles && previousFiles.length) {
+    html.append("var previousFilesData = " + JSON.stringify(previousFiles) + ";");
+    html.append("window.onload = function() {");
+    html.append("  filterPreviousFiles(previousFilesData);");
+    html.append("};");
+  } else {
+    html.append("var previousFilesData = [];");
+  }
+  
+  html.append("function updateStatus(message) {");
+  html.append("  document.getElementById('status').innerHTML = message;");
+  html.append("}");
+  
+  html.append("function updateFileList(files) {");
+  html.append("  var listElement = document.getElementById('fileList');");
+  html.append("  listElement.innerHTML = '';");
+  html.append("  ");
+  html.append("  if (files.length === 0) {");
+  html.append("    listElement.innerHTML = '<p>No matching files found.</p>';");
+  html.append("    return;");
+  html.append("  }");
+  html.append("  ");
+  html.append("  var ul = document.createElement('ul');");
+  html.append("  ul.style.paddingLeft = '20px';");
+  html.append("  ");
+  html.append("  for (var i = 0; i < files.length; i++) {");
+  html.append("    var file = files[i];");
+  html.append("    var li = document.createElement('li');");
+  html.append("    li.textContent = file.name;");
+  html.append("    ul.appendChild(li);");
+  html.append("  }");
+  html.append("  ");
+  html.append("  listElement.appendChild(ul);");
+  html.append("}");
+
+  html.append("function filterPreviousFiles(filesData) {");
+  html.append("  // Process the files that were passed from Step 1 but not selected");
+  html.append("  updateStatus('Processing files from previous step...');");
+  html.append("  document.getElementById('buttonsContainer').innerHTML = '';");
+  html.append("  ");
+  html.append("  // Group files by base name (remove extensions and numeric suffixes)");
+  html.append("  var fileGroups = {};");
+  html.append("  for (var i = 0; i < filesData.length; i++) {");
+  html.append("    var fileInfo = filesData[i];");
+  html.append("    var fullName = fileInfo.name;");
+  html.append("    ");
+  html.append("    // Extract base name without extension and without trailing numbers");
+  html.append("    var baseNameMatch = fullName.match(/^([A-Za-z_]+)(?:\\d*)?\.csv$/i);");
+  html.append("    ");
+  html.append("    if (baseNameMatch) {");
+  html.append("      var baseName = baseNameMatch[1]; // Get the captured group (base name)");
+  html.append("      if (!fileGroups[baseName]) {");
+  html.append("        fileGroups[baseName] = [];");
+  html.append("      }");
+  html.append("      fileGroups[baseName].push(fileInfo);");
+  html.append("    } else {");
+  html.append("      // If the filename doesn't match our pattern, use whole name without extension");
+  html.append("      var simpleName = fullName.replace(/\\.csv$/i, '');");
+  html.append("      if (!fileGroups[simpleName]) {");
+  html.append("        fileGroups[simpleName] = [];");
+  html.append("      }");
+  html.append("      fileGroups[simpleName].push(fileInfo);");
+  html.append("    }");
+  html.append("  }");
+  html.append("  ");
+  html.append("  // For each group, select the appropriate file");
+  html.append("  fileQueue = [];");
+  html.append("  var rejectedFiles = [];");
+  html.append("  ");
+  html.append("  for (var baseName in fileGroups) {");
+  html.append("    var group = fileGroups[baseName];");
+  html.append("    ");
+  html.append("    // Sort files by name (shortest first)");
+  html.append("    group.sort(function(a, b) {");
+  html.append("      return a.name.length - b.name.length;");
+  html.append("    });");
+  html.append("    ");
+  html.append("    // Check if the file name ends with numbers before .csv");
+  html.append("    var noNumberEnding = [];");
+  html.append("    for (var j = 0; j < group.length; j++) {");
+  html.append("      if (!group[j].name.match(/\\d+\\.csv$/i)) {");
+  html.append("        noNumberEnding.push(group[j]);");
+  html.append("      }");
+  html.append("    }");
+  html.append("    ");
+  html.append("    if (noNumberEnding.length > 0) {");
+  html.append("      // Add the file without numeric ending");
+  html.append("      fileQueue.push(noNumberEnding[0]);");
+  html.append("    } else {");
+  html.append("      // If all files in this group have numeric endings, use the shortest name");
+  html.append("      rejectedFiles.push(group[0]);");
+  html.append("    }");
+  html.append("  }");
+  html.append("  ");
+  html.append("  totalFiles = fileQueue.length;");
+  html.append("  skippedFiles = filesData.length - totalFiles;");
+  html.append("  ");
+  html.append("  // Clear status and show what happened");
+  html.append("  var statusMsg = '<strong>Step 2: File Selection Complete</strong><br>';");
+  html.append("  statusMsg += 'Selected ' + totalFiles + ' files without numeric endings.<br>';");
+  html.append("  statusMsg += 'Skipped ' + skippedFiles + ' files with numeric endings (e.g., \"filename1.csv\").<br><br>';");
+  html.append("  ");
+  html.append("  if (fileQueue.length === 0) {");
+  html.append("    statusMsg += 'No valid files found. Please select files without numeric endings (e.g., \"WX.csv\" instead of \"WX1.csv\").<br><br>';");
+  html.append("    statusMsg += '<button class=\"button\" onclick=\"document.getElementById(\\'files\\').click()\">Select Different Files</button>';");
+  html.append("    updateStatus(statusMsg);");
+  html.append("    return;");
+  html.append("  } else {");
+  html.append("    statusMsg += 'Ready to process files.<br><br>';");
+  html.append("    var buttonsHtml = '<button class=\"button\" onclick=\"processFiles()\">Process Selected Files</button>';");
+  html.append("    document.getElementById('buttonsContainer').innerHTML = buttonsHtml;");
+  html.append("    updateStatus(statusMsg);");
+  html.append("  }");
+  html.append("  ");
+  html.append("  // Show the selected files");
+  html.append("  updateFileList(fileQueue);");
+  html.append("}");
+  
+  html.append("function handleFiles(files) {");
+  html.append("  // Clear previous status");
+  html.append("  updateStatus('Processing selected files...');");
+  html.append("  document.getElementById('buttonsContainer').innerHTML = '';");
+  html.append("  document.getElementById('urlsContainer').style.display = 'none';");
+  html.append("  ");
+  html.append("  // Convert FileList to array of file objects with name property");
+  html.append("  var filesArray = [];");
+  html.append("  for (var i = 0; i < files.length; i++) {");
+  html.append("    filesArray.push({");
+  html.append("      name: files[i].name,");
+  html.append("      file: files[i]");
+  html.append("    });");
+  html.append("  }");
+  html.append("  ");
+  html.append("  // Group files by base name (remove extensions and numeric suffixes)");
+  html.append("  var fileGroups = {};");
+  html.append("  for (var i = 0; i < filesArray.length; i++) {");
+  html.append("    var fileInfo = filesArray[i];");
+  html.append("    var fullName = fileInfo.name;");
+  html.append("    ");
+  html.append("    // Extract base name without extension and without trailing numbers");
+  html.append("    var baseNameMatch = fullName.match(/^([A-Za-z_]+)(?:\\d*)?\.csv$/i);");
+  html.append("    ");
+  html.append("    if (baseNameMatch) {");
+  html.append("      var baseName = baseNameMatch[1]; // Get the captured group (base name)");
+  html.append("      if (!fileGroups[baseName]) {");
+  html.append("        fileGroups[baseName] = [];");
+  html.append("      }");
+  html.append("      fileGroups[baseName].push(fileInfo);");
+  html.append("    } else {");
+  html.append("      // If the filename doesn't match our pattern, use whole name without extension");
+  html.append("      var simpleName = fullName.replace(/\\.csv$/i, '');");
+  html.append("      if (!fileGroups[simpleName]) {");
+  html.append("        fileGroups[simpleName] = [];");
+  html.append("      }");
+  html.append("      fileGroups[simpleName].push(fileInfo);");
+  html.append("    }");
+  html.append("  }");
+  html.append("  ");
+  html.append("  // For each group, select the appropriate file");
+  html.append("  fileQueue = [];");
+  html.append("  var rejectedFiles = [];");
+  html.append("  ");
+  html.append("  for (var baseName in fileGroups) {");
+  html.append("    var group = fileGroups[baseName];");
+  html.append("    ");
+  html.append("    // Sort files by name (shortest first)");
+  html.append("    group.sort(function(a, b) {");
+  html.append("      return a.name.length - b.name.length;");
+  html.append("    });");
+  html.append("    ");
+  html.append("    // Check if the file name ends with numbers before .csv");
+  html.append("    var noNumberEnding = [];");
+  html.append("    for (var j = 0; j < group.length; j++) {");
+  html.append("      if (!group[j].name.match(/\\d+\\.csv$/i)) {");
+  html.append("        noNumberEnding.push(group[j]);");
+  html.append("      }");
+  html.append("    }");
+  html.append("    ");
+  html.append("    if (noNumberEnding.length > 0) {");
+  html.append("      // Add the file without numeric ending");
+  html.append("      fileQueue.push(noNumberEnding[0]);");
+  html.append("    } else {");
+  html.append("      // If all files in this group have numeric endings, use the shortest name");
+  html.append("      rejectedFiles.push(group[0]);");
+  html.append("    }");
+  html.append("  }");
+  html.append("  ");
+  html.append("  totalFiles = fileQueue.length;");
+  html.append("  skippedFiles = filesArray.length - totalFiles;");
+  html.append("  ");
+  html.append("  // Clear status and show what happened");
+  html.append("  var statusMsg = '<strong>Step 2: File Selection Complete</strong><br>';");
+  html.append("  statusMsg += 'Selected ' + totalFiles + ' files without numeric endings.<br>';");
+  html.append("  statusMsg += 'Skipped ' + skippedFiles + ' files with numeric endings (e.g., \"filename1.csv\").<br><br>';");
+  html.append("  ");
+  html.append("  if (fileQueue.length === 0) {");
+  html.append("    statusMsg += 'No valid files found. Please select files without numeric endings (e.g., \"WX.csv\" instead of \"WX1.csv\").<br><br>';");
+  html.append("    statusMsg += '<button class=\"button\" onclick=\"document.getElementById(\\'files\\').click()\">Select Different Files</button>';");
+  html.append("    updateStatus(statusMsg);");
+  html.append("    return;");
+  html.append("  } else {");
+  html.append("    statusMsg += 'Ready to process files.<br><br>';");
+  html.append("    var buttonsHtml = '<button class=\"button\" onclick=\"processFiles()\">Process Selected Files</button>';");
+  html.append("    document.getElementById('buttonsContainer').innerHTML = buttonsHtml;");
+  html.append("    updateStatus(statusMsg);");
+  html.append("  }");
+  html.append("  ");
+  html.append("  // Show the selected files");
+  html.append("  updateFileList(fileQueue);");
+  html.append("}");
+  
+  html.append("function processFiles() {");
+  html.append("  if (fileQueue.length === 0) {");
+  html.append("    updateStatus('No files to process. Please select files first.');");
+  html.append("    return;");
+  html.append("  }");
+  html.append("  ");
+  html.append("  updateStatus('Processing ' + fileQueue.length + ' files...');");
+  html.append("  document.getElementById('buttonsContainer').innerHTML = '';");
+  html.append("  document.getElementById('urlsContainer').style.display = 'none';");
+  html.append("  ");
+  html.append("  // Prepare file data for processing");
+  html.append("  var fileData = [];");
+  html.append("  ");
+  html.append("  function processNextFile(index) {");
+  html.append("    if (index >= fileQueue.length) {");
+  html.append("      // All files read, send to server");
+  html.append("      google.script.run");
+  html.append("        .withSuccessHandler(function(result) {");
+  html.append("          var message = '<strong>Processing Results:</strong><br>';");
+  html.append("          createdSpreadsheetIds = [];");
+  html.append("          ");
+  html.append("          if (result.success && result.success.length > 0) {");
+  html.append("            message += '<br>Successfully processed ' + result.success.length + ' files:<br>';");
+  html.append("            var urls = '';");
+  html.append("            for (var i = 0; i < result.success.length; i++) {");
+  html.append("              var file = result.success[i];");
+  html.append("              message += '- ' + file.name + ' (' + file.rows + ' rows)';");
+  html.append("              if (file.spreadsheetId) {");
+  html.append("                var url = 'https://docs.google.com/spreadsheets/d/' + file.spreadsheetId + '/edit';");
+  html.append("                createdSpreadsheetIds.push({");
+  html.append("                  id: file.spreadsheetId,");
+  html.append("                  name: file.name.replace(/\\.csv$/i, ''),");
+  html.append("                  url: url");
+  html.append("                });");
+  html.append("                urls += url + '\\n';");
+  html.append("              }");
+  html.append("              message += '<br>';");
+  html.append("            }");
+  html.append("            message += '<br>Created ' + createdSpreadsheetIds.length + ' new spreadsheets.<br><br>';");
+  html.append("            ");
+  html.append("            // Display URLs in textarea");
+  html.append("            document.getElementById('spreadsheetUrls').value = urls;");
+  html.append("            document.getElementById('urlsContainer').style.display = 'block';");
+  html.append("          }");
+  html.append("          ");
+  html.append("          if (result.errors && result.errors.length > 0) {");
+  html.append("            message += '<br>Errors:<br>';");
+  html.append("            for (var j = 0; j < result.errors.length; j++) {");
+  html.append("              var error = result.errors[j];");
+  html.append("              message += '- ' + error.file + ': ' + error.error + '<br>';");
+  html.append("            }");
+  html.append("          }");
+  html.append("          ");
+  html.append("          updateStatus(message);");
+  html.append("          ");
+  html.append("          // Add buttons for next actions");
+  html.append("          var buttonsHtml = '';");
+  html.append("          ");
+  html.append("          if (createdSpreadsheetIds.length > 0) {");
+  html.append("            buttonsHtml += '<button class=\"button\" onclick=\"openAllSheets()\">Open All Sheets in New Tabs</button>';");
+  html.append("            buttonsHtml += '<button class=\"button\" onclick=\"copyUrlsToClipboard()\">Copy URLs to Clipboard</button>';");
+  html.append("          }");
+  html.append("          ");
+  html.append("          buttonsHtml += '<button class=\"button\" onclick=\"deleteAllTabsExceptSource()\">Delete All Tabs Except Source</button>';");
+  html.append("          buttonsHtml += '<button class=\"button\" onclick=\"google.script.run.showNextPhase()\">Continue to Next Step</button>';");
+  html.append("          document.getElementById('buttonsContainer').innerHTML = buttonsHtml;");
+  html.append("        })");
+  html.append("        .withFailureHandler(function(error) {");
+  html.append("          updateStatus('<strong>Error:</strong> ' + error);");
+  html.append("          document.getElementById('buttonsContainer').innerHTML = '<button class=\"button\" onclick=\"processFiles()\">Try Again</button>';");
+  html.append("        })");
+  html.append("        .processCSVFiles(fileData);");
+  html.append("      return;");
+  html.append("    }");
+  html.append("    ");
+  html.append("    var fileInfo = fileQueue[index];");
+  html.append("    ");
+  html.append("    // If the file is from previous step (has content), use it directly");
+  html.append("    if (fileInfo.content) {");
+  html.append("      fileData.push({");
+  html.append("        name: fileInfo.name,");
+  html.append("        content: fileInfo.content");
+  html.append("      });");
+  html.append("      updateStatus('Processing: ' + fileInfo.name + ' (' + (index + 1) + '/' + fileQueue.length + ')');");
+  html.append("      processNextFile(index + 1);");
+  html.append("    } else {");
+  html.append("      // If it's a new file, read it");
+  html.append("      var file = fileInfo.file;");
+  html.append("      var reader = new FileReader();");
+  html.append("      reader.onload = function(e) {");
+  html.append("        fileData.push({");
+  html.append("          name: file.name,");
+  html.append("          content: e.target.result");
+  html.append("        });");
+  html.append("        updateStatus('Processing: ' + file.name + ' (' + (index + 1) + '/' + fileQueue.length + ')');");
+  html.append("        processNextFile(index + 1);");
+  html.append("      };");
+  html.append("      reader.readAsText(file);");
+  html.append("    }");
+  html.append("  }");
+  html.append("  ");
+  html.append("  // Start processing");
+  html.append("  processNextFile(0);");
+  html.append("}");
+  
+  html.append("function openAllSheets() {");
+  html.append("  if (createdSpreadsheetIds.length === 0) {");
+  html.append("    alert('No spreadsheets available to open.');");
+  html.append("    return;");
+  html.append("  }");
+  html.append("  ");
+  html.append("  for (var i = 0; i < createdSpreadsheetIds.length; i++) {");
+  html.append("    window.open(createdSpreadsheetIds[i].url, '_blank');");
+  html.append("  }");
+  html.append("}");
+  
+  html.append("function copyUrlsToClipboard() {");
+  html.append("  var urlsTextarea = document.getElementById('spreadsheetUrls');");
+  html.append("  urlsTextarea.select();");
+  html.append("  document.execCommand('copy');");
+  html.append("  alert('URLs copied to clipboard!');");
+  html.append("}");
+  
+  html.append("function deleteAllTabsExceptSource() {");
+  html.append("  google.script.run");
+  html.append("    .withSuccessHandler(function(result) {");
+  html.append("      if (result.success) {");
+  html.append("        updateStatus(document.getElementById('status').innerHTML + '<br><br>All tabs except Source deleted successfully.');");
+  html.append("      } else {");
+  html.append("        updateStatus(document.getElementById('status').innerHTML + '<br><br>Error deleting tabs: ' + result.error);");
+  html.append("      }");
+  html.append("    })");
+  html.append("    .withFailureHandler(function(error) {");
+  html.append("      updateStatus(document.getElementById('status').innerHTML + '<br><br>Error deleting tabs: ' + error);");
+  html.append("    })");
+  html.append("    .deleteAllTabsExceptSource();");
+  html.append("}");
+  html.append("</script>");
+  
+  html.append("</body>");
+  html.append("</html>");
+  
+  SpreadsheetApp.getUi().showModalDialog(html, "Import CSV Files");
+}
+
+// Server-side function to process the CSV files
+function processCSVFiles(fileDataArray) {
+  var result = {
+    success: [],
+    errors: []
+  };
+  
+  var sourceFileId = SpreadsheetApp.getActiveSpreadsheet().getId(); // Get current spreadsheet ID for permissions
+  
+  for (var i = 0; i < fileDataArray.length; i++) {
+    var fileData = fileDataArray[i];
+    
+    try {
+      // Create a new spreadsheet from the CSV data
+      var csvData = Utilities.parseCsv(fileData.content);
+      var fileName = fileData.name.replace(/\.csv$/i, '');
+      var newSpreadsheet = SpreadsheetApp.create(fileName);
+      var sheet = newSpreadsheet.getActiveSheet();
+      
+      // Write the CSV data to the sheet
+      sheet.getRange(1, 1, csvData.length, csvData[0].length).setValues(csvData);
+      
+      // Copy permissions from source spreadsheet
+      var newSpreadsheetId = newSpreadsheet.getId();
+      copyPermissions(sourceFileId, newSpreadsheetId);
+      
+      // Add success info
+      result.success.push({
+        name: fileData.name,
+        rows: csvData.length,
+        spreadsheetId: newSpreadsheetId
+      });
+    } catch (error) {
+      // Log the error and continue
+      result.errors.push({
+        file: fileData.name,
+        error: error.toString()
+      });
+    }
+  }
+  
+  return result;
+}
+
+// Function to copy permissions from source file to target file
+function copyPermissions(sourceFileId, targetFileId) {
   try {
-    // Get data from source sheet
-    const sourceData = sourceSheet.getRange('A1:B' + sourceSheet.getLastRow()).getValues();
-    const referenceDataWithIndices = sourceData
-      .map((row, index) => ({
-        fnsku: row[0],
-        quantity: parseInt(row[1]),
-        rowIndex: index + 1,
-        originalRow: row
-      }))
-      .filter(item => item.fnsku && !isNaN(item.quantity) && item.quantity > 0);
+    var sourceFile = DriveApp.getFileById(sourceFileId);
+    var targetFile = DriveApp.getFileById(targetFileId);
     
-    // Get all rows from current sheet
-    const currentData = currentSheet.getRange('A1:A' + currentSheet.getLastRow()).getValues();
+    // Get the sharing access and permission from source file
+    var access = sourceFile.getSharingAccess();
+    var permission = sourceFile.getSharingPermission();
     
-    // Keep track of matched reference rows
-    const matchedRefIndices = new Set();
-    const deletedRows = [];
+    // Clear any existing permissions (except owner)
+    targetFile.setSharing(DriveApp.Access.PRIVATE, DriveApp.Permission.NONE);
     
-    // Process rows and decide which ones to keep
-    const processedRows = currentData.map((row, index) => {
-      const text = row[0];
-      
-      if (index === 0) {
-        const parsedData = parseTransferText(text);
-        if (!parsedData) return { text, keep: true };
-        
-        const absQuantity = Math.abs(parsedData.quantity);
-        const matchedRef = referenceDataWithIndices.find(ref => 
-          ref.fnsku === parsedData.fnsku && 
-          ref.quantity === absQuantity
-        );
-        if (matchedRef) {
-          matchedRefIndices.add(matchedRef.rowIndex);
-          deletedRows.push({ fnsku: parsedData.fnsku, quantity: absQuantity });
-        }
-        return { text, keep: !matchedRef };
-      }
-      
-      if (!text) return { text, keep: false };
-      
-      const parsedData = parseTransferText(text);
-      if (!parsedData) return { text, keep: true };
-      
-      const absQuantity = Math.abs(parsedData.quantity);
-      const matchedRef = referenceDataWithIndices.find(ref => 
-        ref.fnsku === parsedData.fnsku && 
-        ref.quantity === absQuantity &&
-        !matchedRefIndices.has(ref.rowIndex)
-      );
-      
-      if (matchedRef) {
-        matchedRefIndices.add(matchedRef.rowIndex);
-        deletedRows.push({ fnsku: parsedData.fnsku, quantity: absQuantity });
-      }
-      return { text, keep: !matchedRef };
-    });
-    
-    // Filter rows to keep
-    const remainingRows = processedRows
-      .filter(row => row.keep)
-      .map(row => [row.text]);
-    
-    // Clear and update current sheet
-    currentSheet.clearContents();
-    if (remainingRows.length > 0) {
-      currentSheet.getRange(1, 1, remainingRows.length, 1).setValues(remainingRows);
-      currentSheet.autoResizeColumn(1);
+    // Copy "Anyone with link" settings
+    if (access === DriveApp.Access.ANYONE || access === DriveApp.Access.ANYONE_WITH_LINK) {
+      targetFile.setSharing(access, permission);
+    } else if (access === DriveApp.Access.DOMAIN || access === DriveApp.Access.DOMAIN_WITH_LINK) {
+      // Handle domain-level sharing
+      targetFile.setSharing(access, permission);
     }
     
-    // Delete matched rows from source sheet
-    if (matchedRefIndices.size > 0) {
-      const rowsToDelete = Array.from(matchedRefIndices).sort((a, b) => b - a);
-      rowsToDelete.forEach(rowIndex => {
-        sourceSheet.deleteRow(rowIndex);
+    // Copy individual user permissions
+    var editors = sourceFile.getEditors();
+    var viewers = sourceFile.getViewers();
+    var commenters = sourceFile.getCommenters();
+    
+    for (var i = 0; i < editors.length; i++) {
+      targetFile.addEditor(editors[i].getEmail());
+    }
+    
+    for (var i = 0; i < viewers.length; i++) {
+      targetFile.addViewer(viewers[i].getEmail());
+    }
+    
+    for (var i = 0; i < commenters.length; i++) {
+      targetFile.addCommenter(commenters[i].getEmail());
+    }
+    
+    return true;
+  } catch (error) {
+    Logger.log("Error copying permissions: " + error.toString());
+    // Don't surface permission copy errors to users
+    return true;
+  }
+}
+
+// Function to delete all tabs except Source tab
+function deleteAllTabsExceptSource() {
+  try {
+    var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    var sheets = spreadsheet.getSheets();
+    var sourceSheet = null;
+    
+    // Find the Source sheet and collect other sheets to delete
+    var sheetsToDelete = [];
+    for (var i = 0; i < sheets.length; i++) {
+      var sheet = sheets[i];
+      if (sheet.getName().toLowerCase() === "source") {
+        sourceSheet = sheet;
+      } else {
+        sheetsToDelete.push(sheet);
+      }
+    }
+    
+    // Create Source sheet if it doesn't exist
+    if (!sourceSheet) {
+      sourceSheet = spreadsheet.insertSheet("Source");
+    }
+    
+    // Delete all other sheets
+    for (var i = 0; i < sheetsToDelete.length; i++) {
+      spreadsheet.deleteSheet(sheetsToDelete[i]);
+    }
+    
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.toString() };
+  }
+}
+
+// Function to show the next phase of processing
+function showNextPhase() {
+  // Implement the next step in your workflow
+  // For example:
+  // showDistributeDialog();
+}
+
+/////////////////// PROCESS NO TABS WX FILES  /////////////////////
+
+function processCSVFiles(fileData) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var results = {
+    success: [],
+    errors: []
+  };
+  
+  // Store temporary data in ScriptProperties
+  var tempData = {};
+  
+  for (var i = 0; i < fileData.length; i++) {
+    try {
+      var file = fileData[i];
+      // Extract filename without extension for virtual sheet name
+      var sheetName = file.name.replace(/\.csv$/i, '');
+      
+      // Parse CSV content
+      var csvData = Utilities.parseCsv(file.content);
+      
+      // Check if we have data to import
+      if (csvData && csvData.length > 0) {
+        // Create or get the sheet
+        var sheet = ss.getSheetByName(sheetName);
+        if (!sheet) {
+          // Create new sheet
+          sheet = ss.insertSheet(sheetName);
+        } else {
+          // Clear existing content
+          sheet.clear();
+        }
+        
+        // Set values in the sheet
+        var range = sheet.getRange(1, 1, csvData.length, csvData[0].length);
+        range.setValues(csvData);
+        
+        results.success.push({
+          name: file.name,
+          rows: csvData.length
+        });
+      } else {
+        results.errors.push({
+          file: file.name,
+          error: 'CSV file is empty or invalid'
+        });
+      }
+    } catch (error) {
+      results.errors.push({
+        file: file.name,
+        error: error.toString()
+      });
+    }
+  }
+  
+  // Automatically run cross-reference and delete
+  if (results.success.length > 0) {
+    crossReferenceAndDelete();
+  }
+  
+  return results;
+}
+
+//////////////////////// CALL DISTRIBUTE////////////////////////
+
+function showDistributeDialog() {
+  var html = HtmlService.createHtmlOutputFromFile('DistributeDialog')
+    .setWidth(500)
+    .setHeight(450)
+    .setTitle('Distribute Tabs to New Sheets');
+  SpreadsheetApp.getUi().showModalDialog(html, 'Distribute Tabs to New Sheets');
+}
+
+///////////////////////// PROCESS WX FILES ////////////////////////
+
+
+
+////////////////////// CROSS REFERENCE ////////////////////////
+
+function crossReferenceAndDelete() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sourceSheet = ss.getSheetByName('Source'); // Assuming the source data is in a sheet named 'Source'
+  
+  if (!sourceSheet) {
+    SpreadsheetApp.getUi().alert('Error: Source sheet not found. Please ensure you have a sheet named "Source" with the reference data.');
+    return;
+  }
+  
+  // Get source data
+  const sourceData = sourceSheet.getDataRange().getValues();
+  const sourceHeaders = sourceData[0]; // First row contains headers
+  
+  // Create a map to store CSV Name -> FNSKU -> {quantity, rowIndex} relationships
+  const sourceMap = {};
+  // Store all CSV Names for later checking
+  const allCsvNames = new Set();
+  
+  // Process source data (skip header row)
+  for (let i = 1; i < sourceData.length; i++) {
+    const csvName = sourceData[i][0]; // Column A - CSV Name
+    const fnsku = sourceData[i][1];   // Column B - FNSKU
+    const quantity = sourceData[i][2]; // Column C - Quantity
+    
+    if (!csvName || !fnsku) continue; // Skip if missing key data
+    
+    allCsvNames.add(csvName);
+    
+    if (!sourceMap[csvName]) {
+      sourceMap[csvName] = {};
+    }
+    
+    // Store the quantity and row index in source sheet
+    sourceMap[csvName][fnsku] = {
+      quantity: Math.abs(quantity),
+      rowIndex: i + 1 // +1 because array is 0-indexed but sheet rows are 1-indexed
+    };
+  }
+  
+  // Get all sheets to process
+  const allSheets = ss.getSheets();
+  let processedCount = 0;
+  let tabRowsDeletedCount = 0;
+  
+  // Track which FNSKUs are found in each tab
+  const foundFnskus = {};
+  // Track which CSV Names have matching tabs
+  const foundCsvNames = new Set();
+  // Track source rows to delete when matching data is found and deleted from tabs
+  const matchingSourceRowsToDelete = new Set();
+  
+  // Go through each sheet/tab
+  for (let i = 0; i < allSheets.length; i++) {
+    const currentSheet = allSheets[i];
+    const sheetName = currentSheet.getName();
+    
+    // Skip the source sheet and any other system sheets
+    if (sheetName === 'Source' || sheetName === 'Sheet1') continue;
+    
+    // Check if this sheet name exists in our sourceMap (matches a CSV Name)
+    if (sourceMap[sheetName]) {
+      foundCsvNames.add(sheetName);
+      processedCount++;
+      
+      if (!foundFnskus[sheetName]) {
+        foundFnskus[sheetName] = new Set();
+      }
+      
+      // Get all data from this sheet
+      const sheetData = currentSheet.getDataRange().getValues();
+      const rowsToDelete = [];
+      
+      // Process each row in the sheet (looking for the FNSKU and quantity pattern)
+      for (let row = 0; row < sheetData.length; row++) {
+        const rowText = sheetData[row].join('\t');
+        
+        // Use regex to extract FNSKU and quantity from the text pattern
+        // Looking for pattern like: "12/19/2024 X004HD2HCL WhseTransfers -1 GEU2 DEFECTIVE US"
+        const match = rowText.match(/\d{1,2}\/\d{1,2}\/\d{4}\s+(X[\w\d]+)\s+WhseTransfers\s+(-\d+)/);
+        
+        if (match) {
+          const fnsku = match[1];
+          const quantity = parseInt(match[2]); // This will be negative
+          
+          // Add this FNSKU to the found list
+          foundFnskus[sheetName].add(fnsku);
+          
+          // Check if this FNSKU exists in the source map for this sheet name
+          if (sourceMap[sheetName][fnsku]) {
+            // Check if the absolute values of quantities match
+            if (Math.abs(quantity) <= sourceMap[sheetName][fnsku].quantity) {
+              // Mark this row for deletion
+              rowsToDelete.push(row + 1);
+              
+              // Also mark the corresponding source row for deletion
+              // This is the key fix - we mark matching source rows for deletion
+              matchingSourceRowsToDelete.add(sourceMap[sheetName][fnsku].rowIndex);
+            }
+          }
+        }
+      }
+      
+      // Delete rows in reverse order (to avoid shifting issues)
+      if (rowsToDelete.length > 0) {
+        rowsToDelete.sort((a, b) => b - a); // Sort in descending order
+        
+        for (let j = 0; j < rowsToDelete.length; j++) {
+          currentSheet.deleteRow(rowsToDelete[j]);
+          tabRowsDeletedCount++;
+        }
+      }
+    }
+  }
+  
+  // Now check the source data for rows to delete
+  let sourceRowsToDelete = [];
+  
+  // First add all the matching rows we already identified for deletion
+  sourceRowsToDelete = [...matchingSourceRowsToDelete];
+  
+  // Check for CSV Names that don't have matching tabs
+  for (const csvName of allCsvNames) {
+    if (!foundCsvNames.has(csvName)) {
+      // No matching tab for this CSV Name, mark all rows with this CSV Name for deletion
+      for (let i = 1; i < sourceData.length; i++) {
+        if (sourceData[i][0] === csvName) {
+          sourceRowsToDelete.push(i + 1);
+        }
+      }
+    } else {
+      // For matching tabs, check for FNSKUs that weren't found in the tab
+      const tab = foundFnskus[csvName];
+      
+      // Go through each FNSKU in the source for this CSV Name
+      for (const fnsku in sourceMap[csvName]) {
+        if (!tab.has(fnsku)) {
+          // FNSKU wasn't found in the tab, mark it for deletion in source
+          sourceRowsToDelete.push(sourceMap[csvName][fnsku].rowIndex);
+        }
+      }
+    }
+  }
+  
+  // Delete rows from source sheet in reverse order
+  let sourceRowsDeletedCount = 0;
+  if (sourceRowsToDelete.length > 0) {
+    sourceRowsToDelete = [...new Set(sourceRowsToDelete)]; // Remove duplicates
+    sourceRowsToDelete.sort((a, b) => b - a); // Sort in descending order
+    
+    for (let i = 0; i < sourceRowsToDelete.length; i++) {
+      sourceSheet.deleteRow(sourceRowsToDelete[i]);
+      sourceRowsDeletedCount++;
+    }
+  }
+  
+  // Show a summary of what was done
+  SpreadsheetApp.getUi().alert(
+    `Processing complete!\n\n` +
+    `Sheets processed: ${processedCount}\n` +
+    `Rows deleted from tabs: ${tabRowsDeletedCount}\n` +
+    `Rows deleted from source: ${sourceRowsDeletedCount}`
+  );
+}
+
+////////////////////////////// DELETE TABS //////////////////////////
+
+function deleteAllTabsExceptSource() {
+  // Get the active spreadsheet
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Get all sheets in the spreadsheet
+  var sheets = ss.getSheets();
+  
+  // Loop through all sheets
+  for (var i = 0; i < sheets.length; i++) {
+    var sheet = sheets[i];
+    
+    // Check if the sheet is not named "Source"
+    if (sheet.getName() !== "Source") {
+      // Delete the sheet
+      ss.deleteSheet(sheet);
+    }
+  }
+  
+  // Log completion message
+  Logger.log("All tabs except Source have been deleted.");
+}
+
+///////////////////// GET NAMES FOR DISTRIBUTE //////////////////////
+
+function getSheetNamesExcludingSource() {
+  // Get the active spreadsheet
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Get all sheets in the spreadsheet
+  var sheets = ss.getSheets();
+  
+  // Array to store sheet names and row counts
+  var sheetInfo = [];
+  
+  // Loop through all sheets
+  for (var i = 0; i < sheets.length; i++) {
+    var sheet = sheets[i];
+    
+    // Check if the sheet is not named "Source"
+    if (sheet.getName() !== "Source") {
+      sheetInfo.push({
+        name: sheet.getName(),
+        rowCount: sheet.getLastRow()
+      });
+    }
+  }
+  
+  return sheetInfo;
+}
+
+//////////////////////////// DISTRIBUTE//////////////////////////
+
+function distributeTabs(params) {
+  try {
+    var sourceSpreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    var sourceSpreadsheetId = sourceSpreadsheet.getId();
+    var allSheets = sourceSpreadsheet.getSheets();
+    var tabsPerSheet = parseInt(params.tabsPerSheet);
+    var totalSheets = parseInt(params.totalSheets);
+    var today = new Date();
+    var dateStr = (today.getMonth() + 1) + '/' + today.getDate();
+    
+    var results = {
+      success: true,
+      newSpreadsheets: [],
+      errors: []
+    };
+    
+    // Filter out Sheet1 completely
+    var sheetsToDistribute = [];
+    for (var i = 0; i < allSheets.length; i++) {
+      var sheet = allSheets[i];
+      var sheetName = sheet.getName();
+      if (sheetName !== "Source") {
+        sheetsToDistribute.push(sheet);
+      }
+    }
+    
+    // Check if we have enough sheets to distribute
+    if (sheetsToDistribute.length === 0) {
+      return {
+        success: false,
+        errors: ["No sheets found to distribute"]
+      };
+    }
+    
+    // Create new spreadsheets and distribute tabs
+    var sheetIndex = 0;
+    
+    for (var i = 0; i < totalSheets && sheetIndex < sheetsToDistribute.length; i++) {
+      // Create new spreadsheet
+      var newSpreadsheet = SpreadsheetApp.create(dateStr + ' MACRO ' + (i + 1));
+      var newSpreadsheetId = newSpreadsheet.getId();
+      var newSpreadsheetUrl = newSpreadsheet.getUrl();
+      
+      // Copy permissions using the improved function
+      var permissionSuccess = copyPermissions(sourceSpreadsheetId, newSpreadsheetId);
+      if (!permissionSuccess) {
+        results.errors.push("Warning: Could not fully copy permissions to " + newSpreadsheet.getName() + 
+                           " (continuing with distribution)");
+      }
+      
+      // Get default sheet in new spreadsheet
+      var defaultSheet = newSpreadsheet.getSheets()[0];
+      
+      // Copy tabs to new spreadsheet
+      var tabsCopied = 0;
+      var tabDetails = [];
+      
+      for (var t = 0; t < tabsPerSheet && sheetIndex < sheetsToDistribute.length; t++) {
+        var sourceSheet = sheetsToDistribute[sheetIndex];
+        var sourceRange = sourceSheet.getDataRange();
+        var sourceValues = sourceRange.getValues();
+        
+        // Create new sheet in the new spreadsheet
+        var newSheet;
+        if (t === 0) {
+          // Use default sheet for first tab
+          newSheet = defaultSheet;
+          newSheet.setName(sourceSheet.getName());
+        } else {
+          // Create additional sheets
+          newSheet = newSpreadsheet.insertSheet(sourceSheet.getName());
+        }
+        
+        // Copy data
+        if (sourceValues.length > 0) {
+          newSheet.getRange(1, 1, sourceValues.length, sourceValues[0].length)
+            .setValues(sourceValues);
+        }
+        
+        tabDetails.push({
+          name: sourceSheet.getName(),
+          rows: sourceSheet.getLastRow()
+        });
+        
+        sheetIndex++;
+        tabsCopied++;
+      }
+      
+      results.newSpreadsheets.push({
+        name: newSpreadsheet.getName(),
+        url: newSpreadsheetUrl,
+        tabs: tabDetails
       });
     }
     
-    // Get remaining source data after deletions
-    const remainingSourceData = sourceSheet.getRange('A1:B' + sourceSheet.getLastRow())
-      .getValues()
-      .filter(row => row[0] && row[1])
-      .map(row => ({
-        fnsku: row[0],
-        quantity: row[1]
-      }));
-    
-    return {
-      deletedCount: matchedRefIndices.size,
-      deletedRows: deletedRows,
-      remainingSourceRows: remainingSourceData
-    };
-    
+    return results;
   } catch (error) {
-    Logger.log('Error processing sheet ' + currentSheet.getName() + ': ' + error.toString());
+    Logger.log("Error in distributeTabs: " + error.toString());
     return {
-      deletedCount: 0,
-      deletedRows: [],
-      remainingSourceRows: []
+      success: false,
+      errors: [error.toString()]
     };
   }
-}
-
-// Helper function to parse transfer text
-function parseTransferText(text) {
-  if (!text) return null;
-  
-  const lines = text.split('\n');
-  for (const line of lines) {
-    // Look for a line with tab-separated values
-    if (line.includes('\t')) {
-      const parts = line.split('\t');
-      if (parts.length >= 4) {
-        return {
-          fnsku: parts[1],
-          quantity: parseInt(parts[3])
-        };
-      }
-    }
-  }
-  return null;
-}
-
-// Update the processQueue function to run cross-reference after processing
-function processQueue() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const statusSheet = spreadsheet.getSheetByName("Processing Status");
-  const queueData = statusSheet.getRange("A2:C" + statusSheet.getLastRow()).getValues();
-  
-  // Sort the queue by order
-  const sortedQueue = queueData
-    .map((row, index) => ({ filename: row[0], status: row[1], order: row[2] }))
-    .sort((a, b) => a.order - b.order);
-  
-  // Get reference to the lookup spreadsheet
-  const lookupSpreadsheet = SpreadsheetApp.openById('1-HtcVsqcFTMmZLveiuzzH0R4lxivHBxVrLgIbHzqNWk');
-  const lookupSheet = lookupSpreadsheet.getSheetByName('Ced WX - Oct Audit list');
-  const lookupData = lookupSheet.getRange('B:C').getValues();
-  
-  // Process files in order
-  for (let i = 0; i < sortedQueue.length; i++) {
-    const { filename, status } = sortedQueue[i];
-    if (status === "Queued") {
-      const rowIndex = queueData.findIndex(row => row[0] === filename) + 2;
-      statusSheet.getRange(rowIndex, 2).setValue("Processing");
-      processFile(filename, i + 1);
-      statusSheet.getRange(rowIndex, 2).setValue("Completed");
-    }
-  }
-  
-  // Run cross-reference after all files are processed
-  crossReferenceWithSource();
-  
-  // Clean up status sheet
-  Utilities.sleep(2000);
-  spreadsheet.deleteSheet(statusSheet);
-}
-
-function deleteSpecificSheets() {
-  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  var sheetsToDelete = ["Sheet1", "Cross-Reference Summary"];
-  
-  // Iterate through sheets to delete
-  sheetsToDelete.forEach(function(sheetName) {
-    var sheet = spreadsheet.getSheetByName(sheetName);
-    
-    // Check if the sheet exists before trying to delete
-    if (sheet) {
-      spreadsheet.deleteSheet(sheet);
-    }
-  });
-}
-
-// Update the onOpen function to show the menu
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('CSV Processor')
-    .addItem('Upload and Process CSV Files', 'processCSVFilesFromDrive')
-    .addItem('Make Multiple Copies', 'makeCopies')
-    .addItem('Delete Specific Sheets', 'deleteSpecificSheets')
-    .addToUi();
 }
